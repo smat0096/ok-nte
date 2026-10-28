@@ -58,7 +58,11 @@ from src.tasks.auction.options import (
     CONF_RESULT_SCREENSHOT_MIN,
     CONF_SELL_MODE,
     CONF_SELL_QUALITIES,
+    CONF_VENUE_INSTRUMENT_GROUPS,
+    CONF_VENUE_INSTRUMENT_SEQUENCES,
     INST,
+    INSTRUMENT_GROUP_INHERIT,
+    INSTRUMENT_GROUP_NONE,
     INSTRUMENT_GROUP_SUPREME,
     INSTRUMENT_GROUPS,
     RAISE_MODE_MULTIPLE,
@@ -74,7 +78,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     功能包括: 会场自动切换, 匹配, 确认, 出价, 出价重试, 结算, 低保金领取,
     表情包发送, 藏品出售。配置了「期望会场名」时, 每轮匹配前按资产验资门槛自动
-    换到目标会场; 基础价按当前会场分别取 (见 auction_venue)。
+    换到目标会场; 基础价、仪器组与仪器槽位序列都按当前会场分别取
+    (见 auction_venue / auction_options)。
 
     配置键 / UI 区域 / 纯函数的唯一来源在 `src/tasks/auction/` 子包
     (options / layout / price / venue), 本类直接按名导入使用, 不再保留类级别名;
@@ -140,7 +145,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 出价计数(每口在 _stage_bid_loop 重置): last_bid_price / current_bid_count。
         # 跨轮级: _inventory_stuck(满仓且出售未成功, 置位时下一轮先复核满仓再重试清理,
         #   见 _run_single_round 与 auction_sell.run_round_end_sell) / _instrument_slots
-        #   / _instrument_group(「仪器组」配置的缓存组名, 由入口校验填充) /
+        #   / _instrument_group(当前会场生效的仪器组, 由 _refresh_instrument_group 刷新) /
         #   _instrument_remaining(仪器队列: 尚未使用的满列表槽位号, 按当前视觉顺序) /
         #   _instrument_group_ready。
         # 会话级: _session_result_total / _session_result_rounds / _welfare_state
@@ -156,15 +161,15 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self._inventory_stuck = False
         self._session_result_total = 0
         self._session_result_rounds = 0
-        # 「仪器槽位序列」的解析结果, 由 _validate_instrument_sequence 在任务入口
-        # 填充, 之后每口消耗前由 _refresh_instrument_slots 重读更新; 空 list 表示
-        # 未配置, 沿用 1→5 轮换。
+        # 当前会场生效的「仪器槽位序列」解析结果, 由 _validate_instrument_sequence
+        # 在任务入口填充, 之后每口消耗前由 _refresh_instrument_slots 按会场重读更新;
+        # 空 list 表示未配置, 沿用 1→5 轮换。
         self._instrument_slots: list[int] = []
-        # 上次读到的「仪器槽位序列」配置原文, 供 _refresh_instrument_slots 去重:
+        # 上次读到的有效序列原文(会场专属或通用), 供 _refresh_instrument_slots 去重:
         # 原文没变不重解析不刷日志, 解析失败也只对新的原文告警一次。
         self._instrument_seq_raw: str | None = None
-        # 「仪器组」配置的组名缓存, 由 _validate_instrument_group 在任务入口填充;
-        # 默认取 INSTRUMENT_GROUP_SUPREME, 老配置缺该键时回落到这里。
+        # 当前会场生效的仪器组, 由 _refresh_instrument_group 在每轮装备前刷新;
+        # 通用组默认 INSTRUMENT_GROUP_SUPREME, 会场专属为「沿用通用」时也用它。
         self._instrument_group: str = INSTRUMENT_GROUP_SUPREME
         # 仪器队列: 尚未使用的满列表槽位号, 按当前视觉顺序 (用一场出一个, 下方
         # 上移)。跨场持续; 确认仪器列表已满(执行了装备/补全, 或已装备且无需
@@ -741,7 +746,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         下方仪器上移, 先按 _instrument_remaining 换算当前行; 仪器已用掉则该口
         跳过(等下一件拍品开始时的队列恢复); 使用成功才把该槽位号出队。
         """
-        if not self._assist_enabled(ASSIST_INSTRUMENT):
+        if not self._instrument_enabled_for_venue():
             return
         ordinal = self.current_bid_count + 1
         if self._instrument_served_bid == ordinal:
@@ -779,8 +784,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         卡片是否读出目标组名 (见 _gate_instrument_ready)。
         """
         self._instrument_group_ready = False
-        if not self._assist_enabled(ASSIST_INSTRUMENT):
+        if not self._instrument_enabled_for_venue():
             return
+        # 每轮按当前会场刷新仪器组: 刚换过场时组可能不同, 队列/装备都要跟着变.
+        self._refresh_instrument_group()
         # 结算返回 False 的中途续轮可能停在出价界面而非主界面: 组卡片读得到但
         # 不是目标组的文案时装备流程会点击卡片, 在错误界面上就是误点击。先确认
         # 主界面标题; 探针失败(如「获得物品」弹窗遮罩压暗标题, auction-notes 5.5)
@@ -949,6 +956,37 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return False
         return feature in selected
 
+    def _venue_instrument_enabled(self, venue: str | None) -> bool:
+        """总开关勾选「竞拍仪器」时, 再看会场仪器组是否选了「不使用」。
+
+        会场组为「沿用通用」/空/非法时跟随总开关; 「不使用」时该会场不装备、
+        不使用仪器。总开关本身未勾选时不允许会场单独打开, 避免面板隐藏的配置
+        偷偷生效。
+        """
+        if not self._assist_enabled(ASSIST_INSTRUMENT):
+            return False
+        if venue is None:
+            return True
+        key = auction_venue.instrument_group_key(venue)
+        if key is None:
+            return True
+        value = str(self.config.get(key, INSTRUMENT_GROUP_INHERIT) or "").strip()
+        if value == INSTRUMENT_GROUP_NONE:
+            return False
+        if (
+            value
+            and value != INSTRUMENT_GROUP_INHERIT
+            and value not in INSTRUMENT_GROUPS
+        ):
+            self.log_warning(
+                f"「{key}」取值非法, 按「{INSTRUMENT_GROUP_INHERIT}」处理: {value!r}"
+            )
+        return True
+
+    def _instrument_enabled_for_venue(self) -> bool:
+        """当前会场是否启用竞拍仪器。"""
+        return self._venue_instrument_enabled(self._current_venue)
+
     def _send_emote_once(self) -> None:
         """出价确认成功后按「表情包」勾选发送表情, 实现见 auction_emote.send_first_emote。"""
         if self._assist_enabled(ASSIST_EMOTE):
@@ -1096,11 +1134,23 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         原文并打一条生效序列日志, 供用户对照每口的「X 号槽位(点击第 M 行)」。
         未勾选「竞拍仪器」时不校验: 该配置此刻在面板上是隐藏的, 脏值不应拦住任务。
         """
-        if not self._assist_enabled(ASSIST_INSTRUMENT):
+        if not self._instrument_enabled_for_venue():
             return
         raw = str(self.config.get(CONF_INSTRUMENT_SEQUENCE, "") or "")
         self._instrument_slots = auction_assist.parse_instrument_sequence(raw)
         self._instrument_seq_raw = raw
+        # 所有会场的专属序列都在入口校验一遍: 资产变化可能换场, 不希望换过去才发现
+        # 某个会场的序列写错而在拍卖中途失败.
+        for venue, key in CONF_VENUE_INSTRUMENT_SEQUENCES.items():
+            if not self._venue_instrument_enabled(venue):
+                continue
+            venue_raw = str(self.config.get(key, "") or "").strip()
+            if not venue_raw:
+                continue
+            try:
+                auction_assist.parse_instrument_sequence(venue_raw)
+            except ValueError as e:
+                raise ValueError(f"「{key}」仪器槽位序列非法: {e}") from None
         self.log_info(self._describe_instrument_slots())
 
     def _describe_instrument_slots(self) -> str:
@@ -1109,15 +1159,25 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return "仪器槽位序列: " + "→".join(str(slot) for slot in self._instrument_slots)
         return "仪器槽位序列未配置, 按 1→2→3→4→5 默认轮换"
 
+    def _instrument_sequence_raw_for_venue(self) -> str:
+        """当前会场的槽位序列原文; 会场没单独填时回退通用序列。"""
+        key = auction_venue.instrument_sequence_key(self._current_venue)
+        if key is not None:
+            raw = str(self.config.get(key, "") or "").strip()
+            if raw:
+                return raw
+        return str(self.config.get(CONF_INSTRUMENT_SEQUENCE, "") or "")
+
     def _refresh_instrument_slots(self) -> None:
-        """每口消耗前重读「仪器槽位序列」, 运行中改动即时生效(沿革见 auction-notes 7)。
+        """每口消耗前重读当前会场的「仪器槽位序列」, 运行中改动即时生效。
 
         序列原先只在任务入口解析一次, 无限轮模式下运行中填写的序列整场不生效
         (2026-10-04 用户反馈)。按配置原文去重: 原文没变不重解析不刷日志; 解析
         失败只对新的原文告警一次并沿用上一次合法结果 —— 运行中因改配置终止任务
-        会把现场留在拍品中间, 比沿用旧序列代价更高。
+        会把现场留在拍品中间, 比沿用旧序列代价更高。会场专属序列留空或未识别
+        会场时回退通用序列。
         """
-        raw = str(self.config.get(CONF_INSTRUMENT_SEQUENCE, "") or "")
+        raw = self._instrument_sequence_raw_for_venue()
         if raw == self._instrument_seq_raw:
             return
         self._instrument_seq_raw = raw
@@ -1139,12 +1199,60 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         装备校验会在组列表里永远找不到该组而每轮空转放弃。未勾选「竞拍仪器」时
         不校验(配置此刻在面板上隐藏), 沿用默认组(INSTRUMENT_GROUP_SUPREME)。
         """
-        if not self._assist_enabled(ASSIST_INSTRUMENT):
+        if not self._instrument_enabled_for_venue():
             return
         group = str(self.config.get(CONF_INSTRUMENT_GROUP, INSTRUMENT_GROUP_SUPREME))
         if group not in INSTRUMENT_GROUPS:
             raise ValueError(f"仪器组只能是下拉候选之一: {group!r}")
+        for venue, key in CONF_VENUE_INSTRUMENT_GROUPS.items():
+            if not self._venue_instrument_enabled(venue):
+                continue
+            venue_group = str(
+                self.config.get(key, INSTRUMENT_GROUP_INHERIT) or ""
+            ).strip()
+            if (
+                venue_group
+                and venue_group
+                not in (INSTRUMENT_GROUP_INHERIT, INSTRUMENT_GROUP_NONE)
+                and venue_group not in INSTRUMENT_GROUPS
+            ):
+                raise ValueError(
+                    f"「{key}」只能是「{INSTRUMENT_GROUP_INHERIT}」「{INSTRUMENT_GROUP_NONE}」"
+                    f"或仪器组候选之一: {venue_group!r}"
+                )
         self._instrument_group = group
+
+    def _refresh_instrument_group(self) -> None:
+        """按当前会场切换仪器组; 会场专属值为「沿用通用」或非法时回退通用组。
+
+        组名只影响装配与就绪校验, 每组仪器数量不同, 切换后由
+        _ensure_instrument_group 重新装备并重置仪器队列。
+        """
+        if not self._instrument_enabled_for_venue():
+            return
+        group = None
+        key = auction_venue.instrument_group_key(self._current_venue)
+        if key is not None:
+            raw = str(self.config.get(key, INSTRUMENT_GROUP_INHERIT) or "").strip()
+            if raw and raw != INSTRUMENT_GROUP_INHERIT:
+                if raw in INSTRUMENT_GROUPS:
+                    group = raw
+                else:
+                    self.log_warning(f"「{key}」仪器组非法, 改用通用仪器组: {raw!r}")
+        if group is None:
+            group = str(
+                self.config.get(CONF_INSTRUMENT_GROUP, INSTRUMENT_GROUP_SUPREME)
+                or INSTRUMENT_GROUP_SUPREME
+            )
+        if group not in INSTRUMENT_GROUPS:
+            group = INSTRUMENT_GROUP_SUPREME
+        if group == self._instrument_group:
+            return
+        self._instrument_group = group
+        self._instrument_group_ready = False
+        self.log_info(
+            f"当前会场「{self._current_venue or '未识别'}」使用仪器组: {group}"
+        )
 
     def _warn_if_no_sellable_quality(self) -> None:
         """出售品质清单为空时给出告警: 开了出售模式却没有可出售的品质。

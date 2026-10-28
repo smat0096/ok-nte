@@ -28,6 +28,8 @@ from src.tasks.auction.options import (
     CONF_EXPECTED_VENUE,
     CONF_FIXED_PRICE,
     CONF_VENUE_BASE_PRICES,
+    CONF_VENUE_INSTRUMENT_GROUPS,
+    CONF_VENUE_INSTRUMENT_SEQUENCES,
     VENUE_ALIASES,
     VENUE_ASSET_REQUIREMENTS,
     VENUES,
@@ -107,6 +109,20 @@ def base_price_key(venue: str | None) -> str | None:
     if venue is None:
         return None
     return CONF_VENUE_BASE_PRICES.get(venue)
+
+
+def instrument_group_key(venue: str | None) -> str | None:
+    """当前会场对应的仪器组配置键; 未知会场返回 None。"""
+    if venue is None:
+        return None
+    return CONF_VENUE_INSTRUMENT_GROUPS.get(venue)
+
+
+def instrument_sequence_key(venue: str | None) -> str | None:
+    """当前会场对应的仪器槽位序列配置键; 未知会场返回 None。"""
+    if venue is None:
+        return None
+    return CONF_VENUE_INSTRUMENT_SEQUENCES.get(venue)
 
 
 def resolve_base_price(config: dict, venue: str | None, default: int = 1) -> int:

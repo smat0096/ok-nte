@@ -118,6 +118,10 @@ CONF_HEART_ABANDON = "无心放弃本场"
 # 第 5 个组(紫色, 描述「特供大型藏品...」)的名字在截图里被裁切, 暂不进候选
 # (见 auction-notes 7)。
 CONF_INSTRUMENT_GROUP = "仪器组"
+# 会场专属配置里的「不覆盖」选项: 选中它时沿用上面的通用配置。
+INSTRUMENT_GROUP_INHERIT = "沿用通用"
+# 会场专属仪器组的关闭项: 选中后该会场不装备、不使用仪器, 总开关勾着也没关系.
+INSTRUMENT_GROUP_NONE = "不使用"
 # 组默认值常量(2026-10-04 起指向超级品鉴仪器组, 改名沿革见 auction-notes 4),
 # 至尊仪器组保留在候选末位; 老配置存过的组名不受默认值变化影响。
 INSTRUMENT_GROUP_SUPREME = "超级品鉴仪器组"
@@ -162,6 +166,14 @@ VENUE_ASSET_REQUIREMENTS: dict[str, int] = {
 # 所以基础价按当前会场取, 而不是只保留一个全局值.
 CONF_VENUE_BASE_PRICES: dict[str, str] = {
     venue: f"基础价({venue})" for venue in VENUES
+}
+# 会场专属仪器配置: 仪器组默认「沿用通用」, 槽位序列默认空串, 都回退到上面的
+# 通用配置; 这样老配置不变, 想按会场区分时再逐项填.
+CONF_VENUE_INSTRUMENT_GROUPS: dict[str, str] = {
+    venue: f"仪器组({venue})" for venue in VENUES
+}
+CONF_VENUE_INSTRUMENT_SEQUENCES: dict[str, str] = {
+    venue: f"仪器槽位序列({venue})" for venue in VENUES
 }
 
 # 结算成交价值达到该值时自动截图留档, 0 表示不截图. 截图存框架的 screenshots 目录
@@ -224,7 +236,11 @@ def default_config() -> dict:
         # 竞拍仪器辅助的子配置, 需勾选「竞拍仪器」才生效; 组默认 INSTRUMENT_GROUP_SUPREME,
         # 老配置缺该键时回落到这里; 槽位序列留空维持 1→5 轮换。
         CONF_INSTRUMENT_GROUP: INSTRUMENT_GROUP_SUPREME,
+        **dict.fromkeys(
+            CONF_VENUE_INSTRUMENT_GROUPS.values(), INSTRUMENT_GROUP_INHERIT
+        ),
         CONF_INSTRUMENT_SEQUENCE: "",
+        **dict.fromkeys(CONF_VENUE_INSTRUMENT_SEQUENCES.values(), ""),
         # 出售红辅助的子配置, 需勾选「拍卖成功出售红」才生效; 0 = 不限总是卖.
         CONF_SELL_RED_MAX: 0,
     }
@@ -300,14 +316,31 @@ def config_type() -> dict:
         CONF_INSTRUMENT_GROUP: {
             "options": list(INSTRUMENT_GROUPS),
         },
+        # 会场专属仪器组: 「沿用通用」不覆盖通用配置, 「不使用」关闭该会场仪器.
+        **{
+            key: {
+                "options": [
+                    INSTRUMENT_GROUP_INHERIT,
+                    INSTRUMENT_GROUP_NONE,
+                    *INSTRUMENT_GROUPS,
+                ]
+            }
+            for key in CONF_VENUE_INSTRUMENT_GROUPS.values()
+        },
         CONF_ASSIST_FEATURES: {
             "type": "multi_selection",
             "options": list(ASSIST_FEATURES),
-            # 勾选「永恒之心」才展开其两项专属配置, 勾选「竞拍仪器」展开仪器组
-            # 与槽位序列, 勾选「拍卖成功出售红」展开其价值阈值; 默认面板少五行常驻项.
+            # 勾选「永恒之心」才展开其两项专属配置, 勾选「竞拍仪器」展开通用
+            # 仪器组/槽位序列和三个会场专属项, 勾选「拍卖成功出售红」展开其价值
+            # 阈值; 默认面板少五行常驻项.
             "sub_configs": {
                 ASSIST_HEART: [CONF_HEART_INCREMENT, CONF_HEART_ABANDON],
-                ASSIST_INSTRUMENT: [CONF_INSTRUMENT_GROUP, CONF_INSTRUMENT_SEQUENCE],
+                ASSIST_INSTRUMENT: [
+                    CONF_INSTRUMENT_GROUP,
+                    *CONF_VENUE_INSTRUMENT_GROUPS.values(),
+                    CONF_INSTRUMENT_SEQUENCE,
+                    *CONF_VENUE_INSTRUMENT_SEQUENCES.values(),
+                ],
                 ASSIST_SELL_RED: [CONF_SELL_RED_MAX],
             },
         },
@@ -419,22 +452,43 @@ def config_description() -> dict:
         "低保金=资产低于 10 万时自动领; "
         "永恒之心(实验)=每场看展柜有没有永恒之心, 有就加价、没有可以放弃这场; "
         "竞拍仪器(实验)=每回合出价前用一个仪器, 每轮自动检查并装上「仪器组」选的组, "
-        "用完了下一件拍品开始时自动买(真扣钱); 拍卖成功出售红=结算先点品质红再一键出售, "
+        "用完了下一件拍品开始时自动买(真扣钱), 会场仪器组选「不使用」可单独关掉; "
+        "拍卖成功出售红=结算先点品质红再一键出售, "
         "只卖红色藏品(配「拍卖成功一键出售」模式用)",
         CONF_HEART_INCREMENT: "检测到永恒之心时, 在算出的价上多加一笔固定的钱; "
         f"对自定义价格、按系统估价、{BID_MODE_SMART}生效, "
         "「指定回合价格」和「每轮指定价格」不加; 0=不加",
         CONF_HEART_ABANDON: "展柜里没检测到永恒之心就放弃这场, 等下一场; 默认关",
-        CONF_INSTRUMENT_GROUP: "每轮开始自动检查: 没装就装上选的组; 装了但仪器用完"
-        "(组被顶到最上面)就自动「一键补全/购买并使用」并确认, 真扣钱; 都正常就直接继续。"
-        "每组仪器数量不一样(初级泛用组 3 个, 至尊组 5 个), 「仪器槽位序列」的槽位号"
-        "按选的组从上往下数",
-        CONF_INSTRUMENT_SEQUENCE: "每回合出价前按这里填的顺序用一个槽位的仪器, 用到头"
+        CONF_INSTRUMENT_GROUP: "通用仪器组: 每轮开始自动检查, 没装就装上选的组; 装了但"
+        "仪器用完(组被顶到最上面)就自动「一键补全/购买并使用」并确认, 真扣钱; 都正常就"
+        "直接继续。每组仪器数量不一样(初级泛用组 3 个, 至尊组 5 个), 「仪器槽位序列」的"
+        "槽位号按选的组从上往下数; 某个会场单独填了仪器组时以会场配置为准",
+        # 每个会场一个仪器组: 默认「沿用通用」, 不覆盖上面的通用配置;
+        # 选「不使用」时该会场直接关闭仪器, 组和槽位序列都不生效.
+        **{
+            key: (
+                f"当前会场是「{venue}」时用这个仪器组; "
+                f"选「{INSTRUMENT_GROUP_INHERIT}」=沿用上面的通用「仪器组」, "
+                f"选「{INSTRUMENT_GROUP_NONE}」=该会场不装备、不使用仪器; "
+                "会场识别不出也走通用"
+            )
+            for venue, key in CONF_VENUE_INSTRUMENT_GROUPS.items()
+        },
+        CONF_INSTRUMENT_SEQUENCE: "通用仪器槽位序列: 每回合出价前按这里填的顺序用一个槽位的仪器, 用到头"
         "再从头来; 数字是补全后满列表从上往下数的槽位号, 仪器用掉后下面的会上移, "
         "任务自己会算该点哪一行; 0=这一回合不用仪器; 留空=按 1 到 5 轮着用, "
         "即第一回合用 1 号、第二回合用 2 号…每回合消耗一个, 用完后这场剩下的回合都跳过。"
         "低级场建议不使用仪器, 不勾「竞拍仪器」就行; 填了 0-5 以外的字符或"
-        "全是 0 时不让启动",
+        "全是 0 时不让启动; 某个会场单独填了序列时以会场配置为准; "
+        "该会场仪器组选「不使用」时序列不生效",
+        # 每个会场一个槽位序列: 留空沿用通用序列.
+        **{
+            key: (
+                f"当前会场是「{venue}」时用这个槽位序列; 留空=沿用上面的通用"
+                "「仪器槽位序列」; 填法同通用序列(0=跳过该回合)"
+            )
+            for venue, key in CONF_VENUE_INSTRUMENT_SEQUENCES.items()
+        },
         CONF_SELL_RED_MAX: "填正整数才生效: 这件的成交价(当前估价)低于这个数才卖红, "
         "不低于它、或者价读不出来, 都留着不卖; 0=不限, 红的一律卖",
         # --- 会场 ---
@@ -549,6 +603,11 @@ INST = "<br>".join(
             "「永恒之心」(有心加价、没心弃局)和「竞拍仪器」(每回合用一个仪器, 「仪器槽位序列」定用哪个,"
             " 组在「仪器组」里选, 用完了下件拍品自动买、真扣钱; 低级场建议不用)是实验功能, 默认关",
             indent=1,
+        ),
+        _inst_line(
+            "「仪器组/槽位序列」可按会场分开: 组选「沿用通用」或序列留空=用上面的通用配置; "
+            "某个会场的仪器组选「不使用」就单独关掉该会场的仪器",
+            indent=2,
         ),
         _inst_line(
             "「拍卖成功出售红」= 结算先点品质红再一键出售, 只卖红; "
