@@ -25,6 +25,7 @@ from src.tasks.auction import round as auction_round
 from src.tasks.auction import routing as auction_routing
 from src.tasks.auction import sell as auction_sell
 from src.tasks.auction import settle as auction_settle
+from src.tasks.auction import venue as auction_venue
 from src.tasks.auction import welfare as auction_welfare
 from src.tasks.auction.layout import (
     RE_BID,
@@ -71,12 +72,13 @@ from src.tasks.NTEOneTimeTask import NTEOneTimeTask
 class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     """自动完成游戏内拍卖流程。
 
-    功能包括: 匹配, 确认, 出价, 出价重试, 结算, 低保金领取, 表情包发送, 藏品出售。
-    需要在拍卖主界面选择低级会场后开始执行。
+    功能包括: 会场自动切换, 匹配, 确认, 出价, 出价重试, 结算, 低保金领取,
+    表情包发送, 藏品出售。配置了「期望会场名」时, 每轮匹配前按资产验资门槛自动
+    换到目标会场; 基础价按当前会场分别取 (见 auction_venue)。
 
     配置键 / UI 区域 / 纯函数的唯一来源在 `src/tasks/auction/` 子包
-    (options / layout / price), 本类直接按名导入使用, 不再保留类级别名;
-    出售 / 低保 / 回场的行为常量定义在各自的子包模块里。
+    (options / layout / price / venue), 本类直接按名导入使用, 不再保留类级别名;
+    出售 / 低保 / 回场 / 会场的行为常量定义在各自的子包模块里。
     """
 
     # 轮次末尾出售流程的总预算。出售是收尾动作, 不该像拍卖阶段那样吃掉整轮 600 秒
@@ -183,6 +185,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 结算后观测最早在首轮结算后才跑, 带低资产直接进场时首轮仍会按原模式
         # 出价, 预检在入场确认后补一次读数 (见 auction_routing.route_before_first_bid)。
         self._asset_route_prechecked = False
+        # 当前会场的归一化结果(None = 未识别), 由 _check_expected_venue 与每轮
+        # _ensure_expected_venue 刷新; 出价时据此取对应会场的基础价 (见 auction_venue)。
+        self._current_venue: str | None = None
         # 轮次级状态的初始值与每轮重置共用同一入口; 必须在 _welfare_state 之后调用,
         # 切日逻辑要读它。
         self._reset_round_state()
@@ -234,6 +239,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                     # 每轮都重新确认一次入口: 上一轮掉线或异常退出时人可能已经
                     # 不在拍卖界面 (见 auction_recovery.ensure_auction_entry)。
                     self._ensure_auction_entry(boxes)
+                    # 会场切换放在资产路由与仪器组校验之前: 换场可能扣入场费并
+                    # 刷新主界面, 后续的资产读数与装备校验都要基于新会场.
+                    self._ensure_expected_venue(boxes)
                     auction_routing.route_before_first_bid(self, boxes)
                     self._ensure_instrument_group(boxes)
                     self._run_single_round(boxes)
@@ -425,18 +433,26 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     def _check_expected_venue(self, boxes: AuctionBoxes, venue: str | None = None) -> None:
         """配置了期望会场时校验当前会场并留痕, 不匹配只告警不停止。
 
-        包含匹配而不是全等: 会场全集未知, 用户填「海贝」就要能命中「当前：海贝场」。
+        包含匹配而不是全等: 会场全集未知, 用户填「海贝」就要能命中「当前：海贝场」;
+        归一化后「真珠场」与「珍珠场」也视为同一会场 (见 auction_venue)。
         会场读不出时不告警 —— 回场过渡帧里经常读不到, 每轮都报是噪声。
         """
         if venue is None:
             venue = self._read_current_venue()
         self.info_set("当前会场", venue or "未识别")
+        # 缓存归一化会场供出价时选基础价; 切换动作由每轮匹配前的
+        # _ensure_expected_venue 负责, 这里只做留痕与告警.
+        self._current_venue = auction_venue.normalize_venue(venue)
 
         expected = str(self.config.get(CONF_EXPECTED_VENUE, "") or "").strip()
         if not expected or not venue:
             return
-        if expected not in venue:
-            self.log_warning(f"当前会场「{venue}」不包含期望的「{expected}」, 请确认会场选择")
+        if not auction_venue.venue_matches(expected, venue):
+            self.log_warning(f"当前会场「{venue}」不是期望的「{expected}」, 将尝试自动切换")
+
+    def _ensure_expected_venue(self, boxes: AuctionBoxes) -> bool:
+        """每轮匹配前核对并自动切换期望会场, 实现见 auction_venue.ensure_expected_venue。"""
+        return auction_venue.ensure_expected_venue(self, boxes)
 
     def _try_sell_collections(self, state: PostRoundState, boxes: AuctionBoxes) -> None:
         """轮次末尾的出售入口: 给出售流程一个独立的、有界的预算。

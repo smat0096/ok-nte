@@ -68,7 +68,7 @@ class LauncherTask(BaseNTETask):
 
     def run(self):
         self.scene.set_game_capture_ready(False)
-        self.log_info("Launcher task started")
+        self.log_info(f"Launcher task started (admin={is_admin()})")
         dismiss_screensaver()
 
         if not self._check_admin():
@@ -83,13 +83,19 @@ class LauncherTask(BaseNTETask):
             return
 
         self.scene.set_logged_in(False)
-        self._prepare_launcher()
+        if not self._prepare_launcher():
+            # 启动器窗口不可见或起游戏比出窗口更快时, 游戏进程可能已经出现:
+            # 直接切到游戏捕获, 不再等启动器按钮, 否则会空等 120 秒后跳过任务.
+            self.log_info("Game process is already running; skipping launcher UI")
+            self._wait_for_game_and_capture()
+            return
         self._capture_launcher()
         if not self._click_start_game():
             raise TaskDisabledException("Timed out waiting for launcher to minimize")
         self._wait_for_game_and_capture()
 
-    def _prepare_launcher(self):
+    def _prepare_launcher(self) -> bool:
+        """准备启动器; 游戏已经在启动/运行时返回 False, 调用方直接去捕获游戏。"""
         launcher_proc = self._find_process(LAUNCHER_EXE)
         self.log_info(f"Launcher process check: {self._format_process(launcher_proc)}")
         if launcher_proc:
@@ -114,9 +120,18 @@ class LauncherTask(BaseNTETask):
         if not launcher_proc:
             self.log_error("Timed out waiting for launcher window")
             raise TaskDisabledException("Timed out waiting for launcher window")
+        if self._is_game_process(launcher_proc):
+            self.log_info("Game process appeared while waiting for launcher window")
+            return False
 
         self.log_info(f"Launcher process ready: {self._format_process(launcher_proc)}")
         self._update_launcher_path(launcher_proc.get("exe"))
+        return True
+
+    @staticmethod
+    def _is_game_process(proc_info) -> bool:
+        """进程信息是否属于游戏本体 (启动器/游戏同 exe 名的版本也能正确区分)。"""
+        return (proc_info.get("name") or "").lower() == GAME_EXE.lower()
 
     def _capture_game(self):
         self.log_info(
@@ -317,6 +332,17 @@ class LauncherTask(BaseNTETask):
         )
         start = time.time()
         while time.time() - start < time_out:
+            # 等启动器窗口时顺带看游戏本体: 有些启动器点开始后自己退出/窗口不可见,
+            # 只等启动器窗口会空耗满 120 秒, 游戏其实已经在启动.
+            if exe_name == LAUNCHER_EXE:
+                game_proc = self._find_process(GAME_EXE)
+                if game_proc:
+                    self.log_info(
+                        "Game process appeared while waiting for launcher window; "
+                        "treating launch as successful"
+                    )
+                    return game_proc
+
             proc, hwnd = self._find_process_window(
                 exe_name,
                 require_title=exe_name == LAUNCHER_EXE,
@@ -395,8 +421,54 @@ class LauncherTask(BaseNTETask):
             if hwnd:
                 return proc, hwnd
 
+        # psutil.process_iter 在部分环境里看不到游戏进程 (反作弊/窗口进程保护),
+        # 但按窗口反查 PID 再取进程信息仍然可用; DeviceManager 也是按窗口找到游戏的.
+        fallback_hwnd, fallback_proc = self._find_process_window_by_enum(
+            exe_names,
+            hwnd_class=capture_config["hwnd_class"],
+            require_title=require_title,
+        )
+        if fallback_proc is not None:
+            return fallback_proc, fallback_hwnd
+
         # Keep detecting a starting process while its main window is not ready yet.
         return first_process, 0
+
+    def _find_process_window_by_enum(self, exe_names, hwnd_class, require_title=False):
+        """按窗口枚举反查进程, 兜底 psutil.process_iter 看不到游戏进程的情况。"""
+        matches = []
+
+        def callback(hwnd, _):
+            try:
+                if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowEnabled(hwnd):
+                    return True
+                if win32gui.GetClassName(hwnd) != hwnd_class:
+                    return True
+                if require_title and not win32gui.GetWindowText(hwnd):
+                    return True
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if not pid:
+                    return True
+                process = psutil.Process(pid)
+                name = process.name() or ""
+                if name.lower() not in exe_names:
+                    return True
+                try:
+                    exe = process.exe()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    exe = ""
+                matches.append((hwnd, {"pid": pid, "name": name, "exe": exe}))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return True
+            except Exception:
+                return True
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        if not matches:
+            return None, 0
+        visible = [item for item in matches if win32gui.IsWindowVisible(item[0])]
+        return visible[0] if visible else matches[0]
 
     def _find_window_for_process(self, proc_info, hwnd_class=None, require_title=False):
         pid = proc_info.get("pid")

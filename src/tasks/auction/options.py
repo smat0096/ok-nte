@@ -126,6 +126,7 @@ INSTRUMENT_GROUPS = (
     "初级数据仪器组",
     "中级泛用仪器组",
     "中级价值仪器组",
+    "高级泛用仪器组",
     INSTRUMENT_GROUP_SUPREME,
     "超级估值仪器组",
     "至尊仪器组",
@@ -136,8 +137,32 @@ INSTRUMENT_GROUPS = (
 CONF_INSTRUMENT_SEQUENCE = "仪器槽位序列"
 
 # --- 会场 ---
-# 期望会场名: 启动与回场后读「当前：XXX场」做包含匹配, 不匹配只告警不停止.
+# 期望会场名: 启动与每轮匹配前读「当前：XXX场」核对; 当前会场不是它且资产达到
+# 目标会场验资门槛时自动打开「选择会场」切过去, 资产不够就留在当前会场继续.
 CONF_EXPECTED_VENUE = "期望会场名"
+
+# 会场全集与验资门槛 (用户 2026-10-28 指定): 海贝无门槛, 珊瑚 100 万, 珍珠 500 万.
+VENUE_SEASHELL = "海贝场"
+VENUE_CORAL = "珊瑚场"
+VENUE_PEARL = "珍珠场"
+VENUES = (VENUE_SEASHELL, VENUE_CORAL, VENUE_PEARL)
+# 会场别称: 游戏内第三种会场可能显示为「真珠场」, OCR 也可能只读到「珊瑚」这种
+# 前缀; 归一化时按这张表收口, 超集匹配由 venue.normalize_venue 负责.
+VENUE_ALIASES: dict[str, tuple[str, ...]] = {
+    VENUE_SEASHELL: ("海贝场", "海贝"),
+    VENUE_CORAL: ("珊瑚场", "珊瑚"),
+    VENUE_PEARL: ("珍珠场", "真珠场", "珍珠", "真珠"),
+}
+VENUE_ASSET_REQUIREMENTS: dict[str, int] = {
+    VENUE_SEASHELL: 0,
+    VENUE_CORAL: 1_000_000,
+    VENUE_PEARL: 5_000_000,
+}
+# 每个会场一个基础价, 0 表示沿用通用「基础价」. 资产变化会被动改变可进入的会场,
+# 所以基础价按当前会场取, 而不是只保留一个全局值.
+CONF_VENUE_BASE_PRICES: dict[str, str] = {
+    venue: f"基础价({venue})" for venue in VENUES
+}
 
 # 结算成交价值达到该值时自动截图留档, 0 表示不截图. 截图存框架的 screenshots 目录
 # (按进程 cwd 解析: 正式版由 pyappify chdir 到 <安装目录>\data\apps\ok-nte\working,
@@ -166,6 +191,9 @@ def default_config() -> dict:
         CONF_SELL_QUALITIES: ["品质白", "品质绿", "品质蓝"],
         CONF_AUTO_RAISE: False,
         CONF_FIXED_PRICE: 1,
+        # 会场专属基础价默认 0 = 沿用「基础价」, 老配置的单一基础价继续生效;
+        # 想按会场分开定价时再填具体数值.
+        **dict.fromkeys(CONF_VENUE_BASE_PRICES.values(), 0),
         CONF_BID_MODE: BID_MODE_ESTIMATE,
         # 估价分档百分比: 默认档位与默认取值都来自参考攻略, 开关默认关闭时 12 个子键全部隐藏.
         CONF_TIERED_RATIO: False,
@@ -215,6 +243,7 @@ def config_type() -> dict:
                 # (框架重排缺陷见 auction-notes 1.3)。
                 BID_MODE_CUSTOM: [
                     CONF_FIXED_PRICE,
+                    *CONF_VENUE_BASE_PRICES.values(),
                     CONF_AUTO_RAISE,
                     CONF_SPECIAL_ROUND,
                 ],
@@ -222,13 +251,22 @@ def config_type() -> dict:
                 # 「基础价」是该模式估价读不出时的回退出价, 用户必须能在面板上改,
                 # 使用指南本就要求按场次填起步价 (auction-notes 4); 排在分档开关
                 # 上方: 每场次该改的是起步价, 分档默认即参考攻略取值基本不用动。
-                BID_MODE_ESTIMATE: [CONF_FIXED_PRICE, CONF_TIERED_RATIO],
+                # 会场专属基础价紧跟其后, 0 = 沿用通用「基础价」。
+                BID_MODE_ESTIMATE: [
+                    CONF_FIXED_PRICE,
+                    *CONF_VENUE_BASE_PRICES.values(),
+                    CONF_TIERED_RATIO,
+                ],
                 # 「基础价」同时挂在 CUSTOM / ESTIMATE / SMART 三个分支下: 出价模式
                 # 是单选下拉框, 各父条件不会同时激活, 不违反上面的重排约束。
-                BID_MODE_SMART: [CONF_FIXED_PRICE],
+                BID_MODE_SMART: [CONF_FIXED_PRICE, *CONF_VENUE_BASE_PRICES.values()],
                 # 期望价值模式: 红池均价是独立输入; 「基础价」只在缺情报降级按
                 # 估价口径出价时兜底, 同样要能在面板上改。
-                BID_MODE_EV: [CONF_RED_POOL_PRICE, CONF_FIXED_PRICE],
+                BID_MODE_EV: [
+                    CONF_RED_POOL_PRICE,
+                    CONF_FIXED_PRICE,
+                    *CONF_VENUE_BASE_PRICES.values(),
+                ],
             },
         },
         # 分档百分比只在开关打开时展开 12 个子键; 开关本身只在「按系统估价」下显示.
@@ -316,11 +354,25 @@ def config_description() -> dict:
         "低保金要资产低于 10 万才领得到, 卖东西会让资产涨上去, 想领低保就别勾贵的",
         # --- 出价 ---
         CONF_AUTO_RAISE: "打开后每回合出价按「加价方式」一回合比一回合高",
-        CONF_FIXED_PRICE: "自定义价格模式: 每回合都出这个价; 按系统估价模式: 算出来的价"
+        CONF_FIXED_PRICE: "通用基础价: 当前会场识别不出, 或下面某个会场的基础价填 0 时"
+        "用这个数。自定义价格模式: 每回合都出这个价; 按系统估价模式: 算出来的价"
         f"比它低就按它出, 估价读不到也按它出; {BID_MODE_SMART}模式: 估价读不到时按它出, "
         f"填个能接受的起步价; {BID_MODE_EV}模式: 情报读不全降级按估价口径出价时, "
         "估价也读不到才按它出。要正整数, 自定义模式填错直接不让启动, 其他模式那一次"
         "出价会因价格不对而失败",
+        # 每个会场一个基础价: 0 = 沿用上面的通用基础价, 主界面识别不到会场也走通用值.
+        **{
+            key: (
+                f"识别到「{venue}」时用这个基础价, 0=沿用上面的「基础价」; "
+                "会场识别不出也退回「基础价」"
+                + (
+                    "。「真珠场」是游戏里的另一种写法, 同样按珍珠场匹配"
+                    if venue == VENUE_PEARL
+                    else ""
+                )
+            )
+            for venue, key in CONF_VENUE_BASE_PRICES.items()
+        },
         CONF_BID_MODE: "决定每回合出多少钱, 五选一。自定义价格=每回合出「基础价」, "
         "可开自动加价往上加; 每轮指定价格=6 次出价各填各的价; 按系统估价=跟着面板"
         "估价出, 可开「估价分档百分比」按价格段定倍数, 算出来低于「基础价」就按"
@@ -386,8 +438,11 @@ def config_description() -> dict:
         CONF_SELL_RED_MAX: "填正整数才生效: 这件的成交价(当前估价)低于这个数才卖红, "
         "不低于它、或者价读不出来, 都留着不卖; 0=不限, 红的一律卖",
         # --- 会场 ---
-        CONF_EXPECTED_VENUE: "启动和掉线回场后核对会场, 识别出来的会场名不含这里填的"
-        "字就告警(比如填「海贝」); 留空=不核对",
+        CONF_EXPECTED_VENUE: "启动和每轮匹配前核对会场: 当前不是它, 且资产达到目标会场"
+        "验资门槛时自动点「选择会场」切过去(海贝 0 / 珊瑚 100 万 / 珍珠 500 万, "
+        "游戏里的「真珠场」同样识别; 换场会扣游戏里的入场费, 珊瑚 5000 / 珍珠 2 万, "
+        "以游戏为准); 资产不够就留在当前会场继续, 只告警不停止; "
+        "识别按包含匹配, 填「珊瑚」也能命中「珊瑚场」; 留空=不核对也不切换",
         # --- 结算观测 ---
         CONF_RESULT_SCREENSHOT_MIN: "填正整数开启: 识别到「一键出售」(成交)且成交价 ≥ 这个"
         "数的场次自动截图存档, 0=关闭只记日志; 截图在安装目录的 data\\apps\\ok-nte\\working"
@@ -429,7 +484,9 @@ INST = "<br>".join(
     [
         _inst_line("📍 开始前", "#FF5555", bold=True),
         _inst_line(
-            "大世界或拍卖界面里点启动就行, 不在里面会自己进; 「循环次数」填 0 就一直跑", indent=1
+            "大世界或拍卖界面里点启动就行, 不在里面会自己进; 「循环次数」填 0 就一直跑; "
+            "「期望会场名」填了会按资产自动换场, 基础价也能按海贝/珊瑚/珍珠分别填",
+            indent=1,
         ),
         _inst_line(
             "半路掉线被踢回大世界也不怕, 会自己走 F5 都市大亨 → 都市闲趣 → 即刻落槌 回来", indent=1

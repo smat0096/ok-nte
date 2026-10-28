@@ -35,6 +35,7 @@ from src.tasks.auction.layout import (
     RE_CURRENT_VENUE,
     RE_MAIN_TITLE,
     RE_VENUE_NAME,
+    RE_VENUE_OPTION,
     AuctionBoxes,
     AuctionState,
 )
@@ -250,8 +251,9 @@ def click_instant_lot(task: AuctionRecoveryOps, deadline: float) -> bool:
 def read_current_venue(task: AuctionRecoveryOps) -> str:
     """读拍卖主界面右侧的「当前：XXX场」。
 
-    优先用 RE_VENUE_NAME 提取会场名(如「海贝场」), 供期望会场校验留痕;
-    场名读不出但区域里有「当前」字样时回落原文留痕(旧行为), 都没有返回空串。
+    优先用 RE_VENUE_NAME 提取会场名(如「海贝场」), 供期望会场校验与自动切换使用;
+    场名读不出但区域里有「当前」字样时回落原文留痕(旧行为), 「当前」也丢了但
+    文本里仍有已知会场名(如「珊瑚场」)时保留原文, 否则返回空串。
     用 match=None 拿全量文本再正则提取: 过滤式 match 会把不含「当前」的会场名
     框丢掉, 整行被 OCR 拆成两个框时尤其如此。
     """
@@ -266,7 +268,9 @@ def read_current_venue(task: AuctionRecoveryOps) -> str:
     found = RE_VENUE_NAME.search(text)
     if found:
         return found.group(1)
-    return text if RE_CURRENT_VENUE.search(text) else ""
+    if RE_CURRENT_VENUE.search(text) or RE_VENUE_OPTION.search(text):
+        return text
+    return ""
 
 
 def ensure_auction_entry(task: AuctionRecoveryOps, boxes: AuctionBoxes) -> None:

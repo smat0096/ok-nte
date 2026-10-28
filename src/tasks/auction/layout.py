@@ -58,6 +58,12 @@ RE_CURRENT_VENUE = re.compile(r"当前")
 # 从「当前：XXX场」整行里提取会场名(如「海贝场」「珊瑚场」), 供期望会场校验
 # 留痕使用。读不出场名时回落 RE_CURRENT_VENUE 保留旧行为(原文留痕)。
 RE_VENUE_NAME = re.compile(r"当前\s*[：:]\s*([\u4e00-\u9fff]{1,6}场)")
+# 主界面「选择会场」按钮与选择面板的候选会场. 第三种会场在游戏里可能显示为
+# 「真珠场」, 与用户配置的「珍珠场」按同一会场处理 (别名见 options.VENUE_ALIASES)。
+RE_VENUE_SELECT = re.compile(r"选择会场|更换会场")
+RE_VENUE_OPTION = re.compile(r"海贝|珊瑚|珍珠|真珠")
+# 选中会场后的进入/确认按钮. 主界面「兑换入口」等按钮不含这里的词, 不会误命中。
+RE_VENUE_ENTER = re.compile(r"进入|入场|确\s*认")
 
 # --- 仪器组 ---
 # 「仪器组合」弹窗标题与内容区关键词; 装备的目标组名来自「仪器组」配置, 在
@@ -108,6 +114,9 @@ class AuctionBoxes:
     price_result_keypad: Box
     main_title: Box
     main_asset: Box
+    # 主界面「当前：XXX场」与会场切换相关的两个区域.
+    current_venue: Box
+    venue_select: Box
     insufficient: Box
     welfare_btn: Box
     welfare_dialog: Box
@@ -264,6 +273,9 @@ POS_CITY_FUN_SCROLL = (0.500, 0.550)  # 子面板内容区中部, 滚动落点
 BOX_CITY_FUN_TITLE = (0.10, 0.09, 0.42, 0.20)
 BOX_CITY_FUN_CARDS = (0.08, 0.22, 0.87, 0.88)  # 卡片区, 「即刻落槌」在最后一页
 BOX_CURRENT_VENUE = (0.630, 0.550, 0.800, 0.598)  # 主界面「当前：XXX场」
+# 主界面右侧「选择会场」按钮: 圆形图标 + 下方文字, 框住两者, 点击框中心落在图标上.
+# 坐标按 2026-10-28 实机 1920x1080 截图 (screenshots/log) 标定.
+BOX_VENUE_SELECT = (0.866, 0.523, 0.966, 0.674)
 
 # 阻塞弹窗右按钮(确认/领取/放弃确认)统一区: 旧四常量同落一条按钮带, 已合并;
 # 区域中心点击与 OCR 命中框点击都可用 (合并依据见 auction-notes 3)。
@@ -361,6 +373,8 @@ def build_boxes(screen: Callable[..., Box]) -> AuctionBoxes:
         price_result_keypad=screen(*BOX_PRICE_RESULT_KEYPAD),
         main_title=screen(*BOX_MAIN_TITLE),
         main_asset=screen(*BOX_MAIN_ASSET),
+        current_venue=screen(*BOX_CURRENT_VENUE),
+        venue_select=screen(*BOX_VENUE_SELECT),
         insufficient=screen(*BOX_INSUFFICIENT),
         welfare_btn=screen(*BOX_WELFARE_BTN),
         welfare_dialog=screen(*BOX_WELFARE_DIALOG),

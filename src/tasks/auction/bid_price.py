@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from src.tasks.auction import config_read as auction_config_read
 from src.tasks.auction import price as auction_price
 from src.tasks.auction import reading as auction_reading
+from src.tasks.auction import venue as auction_venue
 from src.tasks.auction.contracts import AuctionBidPriceOps
 from src.tasks.auction.layout import AuctionBoxes
 from src.tasks.auction.options import (
@@ -36,6 +37,7 @@ from src.tasks.auction.options import (
     CONF_TIER_BOUNDS,
     CONF_TIER_RATIOS,
     CONF_TIERED_RATIO,
+    CONF_VENUE_BASE_PRICES,
     DEFAULT_TIER_PERCENTS,
     MAX_BID_ROUNDS,
 )
@@ -100,8 +102,27 @@ def listed_bid_price(task: AuctionBidPriceOps, bid_count: int) -> int:
 
 
 def _read_base_price(task: AuctionBidPriceOps) -> int:
-    """读「基础价」作出价下限, 非法值告警回退 1; 估价类两个模式共用同一口径。"""
+    """按当前会场读基础价, 非法值告警回退 1; 估价类模式与自定义模式共用同一口径。
+
+    会场专属基础价 > 0 时用它; 为 0(未设置)、会场未识别或配置非法时回退通用
+    「基础价」。资产变化可能让任务换到别的会场, 所以每口都按当前会场重读, 不把
+    首次读到的值锁存。
+    """
     cfg = auction_config_read.ConfigReader(task.config, task.log_warning)
+    venue_key = auction_venue.base_price_key(task._current_venue)
+    if venue_key is not None:
+        value = cfg.read_int(
+            venue_key,
+            0,
+            warn=f"「{venue_key}」不是整数, 改用通用「{CONF_FIXED_PRICE}」",
+        )
+        if value > 0:
+            return value
+        if value < 0:
+            task.log_warning(
+                f"「{venue_key}」必须为正整数或 0(0=沿用基础价), 当前 {value}, "
+                f"改用通用「{CONF_FIXED_PRICE}」"
+            )
     return cfg.read_int(
         CONF_FIXED_PRICE,
         1,
@@ -377,13 +398,38 @@ def validate_tiered_ratio(task: AuctionBidPriceOps) -> None:
             )
 
 
-def warn_if_fixed_price_invalid(task: AuctionBidPriceOps) -> None:
-    """「基础价」非正整数时提前告警, 供依赖基础价的估价类两个模式复用。
+def _parse_optional_base_price(raw: object) -> int | None:
+    """解析会场专属基础价: 空/0 返回 None(未设置), 其他值按 int 解析, 非法抛错误。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    value = int(raw)
+    return None if value == 0 else value
 
-    「按系统估价」算出的价格低于「基础价」时按它出价, 估价读不出时也回退它,
+
+def _validate_venue_base_prices(task: AuctionBidPriceOps) -> None:
+    """自定义模式下校验会场专属基础价: 0/留空合法, 其他必须是正整数。"""
+    for venue, key in CONF_VENUE_BASE_PRICES.items():
+        raw = task.config.get(key)
+        try:
+            value = _parse_optional_base_price(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"「{key}」配置非法, 应为正整数或 0(0=沿用基础价): {raw!r}"
+            ) from None
+        if value is not None and value < 0:
+            raise ValueError(
+                f"「{key}」必须为正整数或 0(0=沿用基础价), 当前: {raw!r}"
+            )
+
+
+def warn_if_fixed_price_invalid(task: AuctionBidPriceOps) -> None:
+    """基础价非法时提前告警, 供依赖基础价的估价类模式复用。
+
+    「按系统估价」算出的价格低于基础价时按它出价, 估价读不出时也回退它,
     逐口追踪在估价读不出时回退它: 非正整数会让那次出价因「非法价格」连续
     失败 3 次丢掉整轮。正常配置下不拦任务(算出价高于基础价时它根本用不到),
-    只提前把后果说清楚。
+    只提前把后果说清楚。会场专属基础价非法时同样只告警: 该会场会回退通用
+    「基础价」, 不会让整次出价必然失败。
     """
     try:
         fallback = int(task.config.get(CONF_FIXED_PRICE))
@@ -395,11 +441,27 @@ def warn_if_fixed_price_invalid(task: AuctionBidPriceOps) -> None:
             f"({task.config.get(CONF_FIXED_PRICE)!r}), "
             "估价读不出时回退的出价将无法输入, 该次出价会失败"
         )
+    for venue, key in CONF_VENUE_BASE_PRICES.items():
+        raw = task.config.get(key)
+        try:
+            value = _parse_optional_base_price(raw)
+        except (TypeError, ValueError):
+            task.log_warning(
+                f"「{key}」不是正整数或 0, 识别到「{venue}」时改用通用"
+                f"「{CONF_FIXED_PRICE}」"
+            )
+            continue
+        if value is not None and value < 0:
+            task.log_warning(
+                f"「{key}」必须为正整数或 0(0=沿用基础价), 当前 {value}, "
+                f"识别到「{venue}」时改用通用「{CONF_FIXED_PRICE}」"
+            )
 
 
 def _validate_custom(task: AuctionBidPriceOps) -> None:
     """自定义价格模式的入口校验: 基础价必填, 自动加价/指定回合开启时才校验各自配置。"""
     auction_price.validate_fixed_price(task.config.get(CONF_FIXED_PRICE))
+    _validate_venue_base_prices(task)
     if task.config.get(CONF_AUTO_RAISE, False):
         auction_price.validate_raise_value(task.config.get(CONF_RAISE_VALUE))
         auction_price.validate_raise_round(task.config.get(CONF_RAISE_ROUND))
@@ -443,15 +505,10 @@ def _price_custom(
     """自定义价格: 基准价为自定义价格, 启用自动加价时按模式计算加价结果;
     启用指定回合单独出价且当前序号在勾选列表中时直接使用该价格。
 
-    基础价每口活读以跟进运行中的改动; 运行中改坏会静默回退 1, 只能靠告警提示
-    (见 auction-notes 5.1)。
+    基础价每口按当前会场活读以跟进运行中的改动; 运行中改坏会回退通用「基础价」
+    或 1, 只能靠告警提示 (见 auction-notes 5.1)。
     """
-    cfg = auction_config_read.ConfigReader(task.config, task.log_warning)
-    base_price = cfg.read_int(
-        CONF_FIXED_PRICE,
-        1,
-        warn=f"「{CONF_FIXED_PRICE}」不是正整数, 本次出价按回退值 1 计算",
-    )
+    base_price = _read_base_price(task)
 
     special_price = special_round_price(task, bid_count)
     if special_price is not None:

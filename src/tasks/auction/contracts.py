@@ -1,9 +1,9 @@
 """能力模块允许访问的任务面。
 
 直持任务实例的能力模块各有声明协议: bid / bid_price / recovery / sell /
-routing / welfare / assist / popup 已迁到各自的窄协议 (AuctionBidOps /
+routing / welfare / assist / popup / venue 已迁到各自的窄协议 (AuctionBidOps /
 AuctionBidPriceOps / AuctionRecoveryOps / AuctionSellOps / AuctionRoutingOps /
-AuctionWelfareOps / AuctionAssistOps / AuctionPopupOps),
+AuctionWelfareOps / AuctionAssistOps / AuctionPopupOps / AuctionVenueOps),
 模块只访问协议声明的成员。
 声明均不为运行时检查, 而是把「模块能碰什么」写进类型系统: 新增跨模块调用
 时必须先在对应协议加一行, 评审时就能被看见, 并受 TestAuctionContracts
@@ -60,6 +60,8 @@ class AuctionBidPriceOps(Protocol):
     # 资产路由的运行时出价模式覆盖(非 None 表示本次运行已路由, 估价模式
     # 据此不继承「基础价」下限, 见 bid_price.estimate_bid_price)。
     _asset_routed_mode: str | None
+    # 当前会场的归一化结果(None/未知会场时基础价回退通用「基础价」, 见 venue.py)。
+    _current_venue: str | None
 
     # --- 日志 ---
     def log_info(self, message: str) -> None: ...
@@ -290,3 +292,40 @@ class AuctionRoutingOps(Protocol):
     # --- 任务侧适配器入口 ---
     def _optional_timeout(self, deadline: float | None, limit: float) -> float | None: ...
     def _reading_ops(self) -> ReadingOps: ...
+
+
+class AuctionVenueOps(Protocol):
+    """venue.py 允许访问的任务面 (仅注解, 无运行时检查)。
+
+    成员按自动切换会场与按会场选基础价的实际访问面逐条声明. 当前会场缓存
+    _current_venue 由任务实例持有, 本模块在 ensure_expected_venue 里刷新它;
+    会场文字读取复用 recovery.read_current_venue 的任务侧入口, 资产读数经
+    _reading_ops 的注入式依赖束, 不直接操作配置。
+    """
+
+    # --- 状态与配置 ---
+    config: dict
+    _current_venue: str | None
+    height: int
+
+    # --- 框架 API ---
+    def ocr(self, *args: Any, **kwargs: Any) -> list: ...
+    def wait_ocr(self, *args: Any, **kwargs: Any) -> list: ...
+    def operate_click(self, *args: Any, **kwargs: Any) -> Any: ...
+    def send_key(self, *args: Any, **kwargs: Any) -> Any: ...
+    def next_frame(self) -> Any: ...
+    def sleep(self, timeout: float) -> Any: ...
+    def info_set(self, key: str, value: object) -> None: ...
+
+    # --- 日志 ---
+    def log_info(self, message: str) -> None: ...
+    def log_warning(self, message: str) -> None: ...
+    def log_debug(self, message: str) -> None: ...
+
+    # --- 任务侧适配器入口 ---
+    def _optional_timeout(self, deadline: float | None, limit: float) -> float | None: ...
+    def _reading_ops(self) -> ReadingOps: ...
+    def _read_current_venue(self) -> str: ...
+    def _log_aux_error(
+        self, where: str, e: Exception, *, quiet: bool = False
+    ) -> None: ...
