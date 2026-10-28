@@ -1,4 +1,4 @@
-"""拍卖掉线回场与弹窗恢复: 大世界探测, 回场路径, 入口确认, 阻塞弹窗兜底。
+"""拍卖掉线回场与弹窗恢复: 断线重连弹窗, 初始界面, 大世界探测, 回场路径, 入口确认, 阻塞弹窗兜底。
 
 模块函数的第一个参数 task 是 AutoBidAuctionTask 实例: OCR/输入/导航等框架
 API 经它访问; 允许访问面由 contracts.AuctionRecoveryOps 窄协议声明, 编排
@@ -21,8 +21,9 @@ auction_welfare / auction_interaction 的公开函数, 转手后的访问面由�
 import time
 from collections.abc import Callable
 
-from ok import TaskDisabledException, WaitFailedException
+from ok import Box, TaskDisabledException, WaitFailedException
 
+from src.Labels import Labels
 from src.tasks.auction import interaction as auction_interaction
 from src.tasks.auction import welfare as auction_welfare
 from src.tasks.auction.contracts import AuctionRecoveryOps
@@ -30,10 +31,14 @@ from src.tasks.auction.layout import (
     BOX_CITY_FUN_CARDS,
     BOX_CITY_FUN_TITLE,
     BOX_CURRENT_VENUE,
+    BOX_RECONNECT_BTN,
+    BOX_RECONNECT_PANEL,
     POS_CITY_FUN_SCROLL,
+    POS_ENTER_GAME,
     RE_CITY_FUN,
     RE_CURRENT_VENUE,
     RE_MAIN_TITLE,
+    RE_RECONNECT_BTN,
     RE_VENUE_NAME,
     RE_VENUE_OPTION,
     AuctionBoxes,
@@ -55,14 +60,30 @@ RECOVER_MAX_PER_ROUND = 1
 ENTRY_PROBE_TIMEOUT = 3
 ENTRY_RECOVER_TIMEOUT = 90
 
+# --- 断线重连弹窗 ---
+# 浅色正文区的亮度门槛 (0~255): 断线面板的正文区是横贯全宽的亮带(实测 ~230),
+# 正常拍卖界面同一区域是深色(~30-60)。sleep_check 每 0.5 秒经过一次, 亮度门控
+# 让正常路径只花一次 numpy 均值, 不做 OCR (识别与点击见 handle_reconnect_popup)。
+RECONNECT_PANEL_BRIGHTNESS = 150
+# 点击「重试」后等弹窗消失的预算: 重连包含加载耗时, 给足; 超时只告警, 界面
+# 去向交回给既有阶段判定与掉线回场路径, 不在这里重复点击。
+RECONNECT_GONE_TIMEOUT = 120
+# 点击「进入游戏」后等初始界面消失(进入加载)的预算, 超时同上交回原流程。
+START_SCREEN_GONE_TIMEOUT = 60
+
 
 def handle_blocking_popup(task: AuctionRecoveryOps, boxes: AuctionBoxes | None = None) -> None:
     """整轮失败后的兜底: 按界面特征处理卡住的弹窗。
 
-    月卡弹窗的时间窗盲区与低保金弹窗残留会让后续每轮识别不到拍卖界面,
-    这里只在已经失败的情况下兜一次, 正常路径没有额外开销 (见 auction-notes 5.5)。
+    断线类打断(重连弹窗/初始界面)排在最前: 它们盖住全部界面特征, 月卡/低保/
+    提示弹窗的检测在其存续期间全部落空。月卡弹窗的时间窗盲区与低保金弹窗残留
+    会让后续每轮识别不到拍卖界面, 这里只在已经失败的情况下兜一次, 正常路径
+    没有额外开销 (见 auction-notes 5.5)。
     """
     try:
+        if task._handle_interrupt_popups():
+            return
+
         if task.find_monthly_card() is not None:
             task.log_info("本轮失败且检测到月卡弹窗, 关闭弹窗后重试")
             task.handle_monthly_card()
@@ -84,6 +105,92 @@ def handle_blocking_popup(task: AuctionRecoveryOps, boxes: AuctionBoxes | None =
         task.log_warning(f"弹窗兜底处理中断: {type(e).__name__}: {e}")
     except Exception as e:
         task._log_aux_error("弹窗兜底处理失败", e)
+
+
+def reconnect_panel_brightness(frame, box: Box) -> float:
+    """断线弹窗浅色正文区的平均亮度 (0~255), 帧缺失或裁剪为空返回 0。
+
+    纯计算无 IO, 合成帧可直接单测 (写法同 assist.heart_pixel_ratio);
+    只做亮度门控, 不承担识别职责 —— 命中后由按钮 OCR 确认。
+    """
+    if frame is None:
+        return 0.0
+    cropped = frame[box.y : box.y + box.height, box.x : box.x + box.width]
+    if cropped.size == 0:
+        return 0.0
+    return float(cropped.mean())
+
+
+def handle_reconnect_popup(task: AuctionRecoveryOps, frame) -> bool:
+    """检测断线重连弹窗, 命中则点「重试」并等弹窗消失。
+
+    断线时游戏弹出的全屏「提示」面板(正文「更新失败,请重新尝试」, 按钮
+    「重试」)会盖住全部拍卖控件与大世界特征: 四种界面状态判定和大世界探测
+    全部落空, 掉线回场永远不会触发, 任务卡死在面板上空转到超时(2026-10-29
+    用户实测)。挂在 sleep_check 钩子上, 循环中的每次睡眠都经过这里(与月卡
+    弹窗同一机制), 由任务侧 _handle_reconnect_popup 转发并做嵌套防护。
+
+    两级检测控制热路径成本: 先量浅色正文区的平均亮度(断线面板是横贯全宽的
+    亮带), 达标才做按钮 OCR 确认, 正常路径只花一次 numpy 均值。
+
+    点击后等弹窗消失(重连含加载耗时): 消失即返回 True 交回原流程 —— 重连
+    落回拍卖界面则各阶段判定直接续跑, 被踢回大世界则由掉线回场路径接管;
+    等不到只告警, 不再重复点击, 下一次钩子回调或轮次失败兜底自然重试。
+    """
+    panel_box = task.box_of_screen(*BOX_RECONNECT_PANEL)
+    if reconnect_panel_brightness(frame, panel_box) < RECONNECT_PANEL_BRIGHTNESS:
+        return False
+    button_box = task.box_of_screen(*BOX_RECONNECT_BTN)
+    found = task.ocr(box=button_box, match=RE_RECONNECT_BTN, log=False)
+    if not found:
+        return False
+    task.log_warning("检测到断线重连弹窗, 点击「重试」重新连接")
+    task.operate_click(found[0], after_sleep=0.5)
+    deadline = time.monotonic() + RECONNECT_GONE_TIMEOUT
+    while time.monotonic() < deadline:
+        task.next_frame()
+        if not task.ocr(box=button_box, match=RE_RECONNECT_BTN, log=False):
+            task.log_info("重连弹窗已消失, 继续原流程")
+            return True
+        task.sleep(0.5)
+    task.log_warning(f"点击「重试」后 {RECONNECT_GONE_TIMEOUT} 秒弹窗仍在, 交回原流程按超时处理")
+    return True
+
+
+def handle_start_screen(task: AuctionRecoveryOps) -> bool:
+    """检测游戏初始界面(启动/登录画面)并点「进入游戏」。
+
+    断线点「重试」后游戏可能不回到对局, 而是整个掉回初始界面: 拍卖控件与
+    大世界特征都没有, 掉线回场同样不触发, 任务只能空转到超时。基类的
+    wait_login 也会点这个按钮, 但它被 scene.logged_in() 门控 —— 拍卖中途
+    断线时场景缓存仍是「已登录」, 永远走不进去, 所以这里独立检测。
+
+    识别沿用 wait_login 的同一模板 Labels.login_setting(右上角设置齿轮,
+    仅初始界面出现), 点击点与 wait_login 同源(见 layout.POS_ENTER_GAME);
+    点击前的前台校验同样沿用 wait_login 的写法。
+
+    点击后等初始界面离开(进入加载): 离开即返回 True, 加载完成落回大世界后由
+    掉线回场路径接管; 等不到只告警, 下一次钩子回调自然重试。检测是每次
+    sleep_check 一次的模板匹配, 与月卡弹窗检测同一成本量级。
+    """
+    if task.find_one(Labels.login_setting) is None:
+        return False
+    task.log_warning("检测到游戏初始界面, 点击「进入游戏」重新进入")
+    if not task.is_foreground():
+        task.bring_to_front()
+        task.sleep(3)
+    task.operate_click(*POS_ENTER_GAME, after_sleep=3)
+    deadline = time.monotonic() + START_SCREEN_GONE_TIMEOUT
+    while time.monotonic() < deadline:
+        task.next_frame()
+        if task.find_one(Labels.login_setting) is None:
+            task.log_info("已离开初始界面, 继续原流程")
+            return True
+        task.sleep(1)
+    task.log_warning(
+        f"点击「进入游戏」后 {START_SCREEN_GONE_TIMEOUT} 秒仍在初始界面, 交回原流程按超时处理"
+    )
+    return True
 
 
 def is_world_screen(task: AuctionRecoveryOps) -> bool:

@@ -198,6 +198,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self._reset_round_state()
         # 启用基类的睡眠钩子, 拍卖流程跨过每日 5 点时靠它处理月卡弹窗.
         self.sleep_check_interval = self.SLEEP_CHECK_INTERVAL
+        # sleep_check 断线类打断(重连弹窗/初始界面)处理的嵌套防护: 轮次失败兜底
+        # (handle_blocking_popup)等非钩子入口的等待期间, task.sleep 会再触发钩子,
+        # 不拦会对着同一界面重复点击。瞬态守卫, 不随轮次重置
+        # (见 _handle_interrupt_popups)。
+        self._handling_interrupt_popup = False
         self.add_exit_after_config()
 
     # --- 任务入口 ---
@@ -275,17 +280,32 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     # --- 外部打断 ---
     def sleep_check(self):
-        """睡眠钩子: 处理月卡弹窗等外部打断, 与其它任务保持同一套机制。
+        """睡眠钩子: 处理断线类打断与月卡弹窗等外部打断, 与其它任务保持同一套机制。
 
+        断线时游戏弹出全屏「提示」面板(正文「更新失败,请重新尝试」), 盖住全部
+        拍卖控件与大世界特征 —— 掉线回场永远不触发, 任务会卡死在面板上
+        (2026-10-29 用户实测)。点「重试」后游戏还可能整个掉回初始界面, 再点
+        「进入游戏」才能回到大世界, 由掉线回场路径接回拍卖
+        (识别与点击见 auction_recovery.handle_reconnect_popup /
+        handle_start_screen)。
         拍卖流程可能跨过每日 5 点的刷新时刻, 此时月卡弹窗会盖住拍卖界面,
         所有阶段状态判定都会失败, 轮询只能一直空转到单轮超时。
         基类在每次 sleep 时按 sleep_check_interval 调用本方法(调用前会刷新帧),
         因此轮询循环、出价中间步骤和结算后处理都被覆盖。
-        check_monthly_card 只在 5 点前后 2 分钟的时间窗内生效, 窗口外只是一次时间比较。
-        钩子会从任意 self.sleep() 调用点冒泡, 月卡处理失败只降级为告警并跳过本次,
-        下一次回调自然重试; TaskDisabledException 照旧传播 (见 auction-notes 5.8)。
+        check_monthly_card 只在 5 点前后 2 分钟的时间窗内生效, 窗口外只是一次时间比较;
+        重连检测先用浅色正文区亮度门控, 无弹窗时只花一次 numpy 均值。
+        钩子会从任意 self.sleep() 调用点冒泡, 打断处理失败都只降级为告警并跳过
+        本次, 下一次回调自然重试; TaskDisabledException 照旧传播
+        (见 auction-notes 5.8)。
         """
         super().sleep_check()
+        try:
+            if self._handle_interrupt_popups():
+                return
+        except TaskDisabledException:
+            raise
+        except Exception as e:
+            self.log_warning(f"断线类打断处理失败, 跳过本次: {type(e).__name__}: {e}")
         try:
             if self.check_monthly_card():
                 self.log_info("检测到月卡弹窗, 关闭后继续当前轮次")
@@ -294,6 +314,26 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             raise
         except Exception as e:
             self.log_warning(f"月卡弹窗处理失败, 跳过本次: {type(e).__name__}: {e}")
+
+    def _handle_interrupt_popups(self) -> bool:
+        """断线类打断的统一入口: 嵌套防护后按序转发 auction_recovery。
+
+        顺序: 重连弹窗优先(它存在时其余检测全部落空), 未命中再看初始界面。
+        防护面向非钩子入口(轮次失败兜底 _handle_blocking_popup): 其等待期间内的
+        task.sleep 会再触发本钩子, 不拦会对着同一界面重复点击。钩子入口本身的
+        嵌套已由框架的 in_sleep_check 守卫拦住(见 TaskExecutor.sleep), 这里只补
+        第二条进入路径。
+        """
+        if self._handling_interrupt_popup:
+            return False
+        self._handling_interrupt_popup = True
+        try:
+            return bool(
+                auction_recovery.handle_reconnect_popup(self, self.frame)
+                or auction_recovery.handle_start_screen(self)
+            )
+        finally:
+            self._handling_interrupt_popup = False
 
     def _handle_blocking_popup(self, boxes: AuctionBoxes | None = None) -> None:
         """整轮失败后的弹窗兜底, 实现见 auction_recovery.handle_blocking_popup。"""
