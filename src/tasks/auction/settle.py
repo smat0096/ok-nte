@@ -140,7 +140,8 @@ def finish_auction(
 
     # 「拍卖成功一键出售」必须在退出拍卖之前完成: 一键出售按钮只在结算界面存在,
     # 且只由出售模式驱动 (「成交价值出售上限」已删除, 见 auction-notes 4)。
-    # 已读的成交价值透传给出售: 「低于此价才卖红」用它决定卖不卖红 (见 auction-notes 7)。
+    # 已读的成交价值透传给出售: 「低于此价才卖红」用它决定点不点品质红
+    # (两条分支都会点一键出售, 见 sell._should_select_sell_red)。
     if actions.sell_mode() == SELL_MODE_ONE_CLICK:
         actions.sell_on_settlement(boxes, deadline, result_value)
 

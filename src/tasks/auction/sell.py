@@ -215,23 +215,34 @@ def _sell_red_enabled(task: AuctionSellOps) -> bool:
     return isinstance(selected, list) and ASSIST_SELL_RED in selected
 
 
-def _sell_red_allowed(task: AuctionSellOps, result_value: int | None, sell_limit: int) -> bool:
-    """「低于此价才卖红」判定: 成交价值低于上限才放行出售红。
+def _should_select_sell_red(
+    task: AuctionSellOps, result_value: int | None, sell_limit: int
+) -> bool:
+    """「低于此价才卖红」判定: 低于上限才补点品质红(连红一起整包出售)。
 
-    result_value 是结算面板已读的当前估价(None = 未读出); 未读出按不放行处理
-    并告警 —— 判定失败的保守方向是保留红色藏品, 少卖可手动补卖。放行返回 True,
-    拦截返回 False(调用方跳过出售红, 也不走「获得物品」处理 —— 没有出售就没有
-    提示条)。
+    结算界面的一键出售默认勾选除红以外的全部品质(用户 2026-10-29 澄清):
+    补点红 = 把红加进勾选, 出售连红整包全卖; 不点 = 只卖除红以外的品质,
+    红色藏品保留入库。返回是否点红:
+    - 上限 <= 0: 不限, 总是点红全卖;
+    - 成交价值低于上限: 点红全卖 —— 这件的红色藏品不值这个价;
+    - 不低于上限、或价值未读出: 不点红, 卖掉其余品质保住红 —— 判定不命中
+      只是不点红, 一键出售照点: 「拍卖成功一键出售」的本职就是成功后清仓,
+      不能一件不卖(2026-10-29 用户实测: 金额超过上限后直接跳过了整次出售)。
     """
+    if sell_limit <= 0:
+        return True
     if result_value is None:
-        task.log_warning("成交价值未读出, 无法核对「低于此价才卖红」, 红色藏品保留不卖")
+        task.log_warning("成交价值未读出, 无法核对「低于此价才卖红」, 不点红, 出售除红以外的品质")
         return False
     if result_value >= sell_limit:
         task.log_info(
-            f"成交价值 {result_value} 不低于「低于此价才卖红」的 {sell_limit}, 红色藏品保留不卖"
+            f"成交价值 {result_value} 不低于「低于此价才卖红」的 {sell_limit}, "
+            "不点选红, 出售除红以外的品质"
         )
         return False
-    task.log_info(f"成交价值 {result_value} 低于「低于此价才卖红」的 {sell_limit}, 执行出售红")
+    task.log_info(
+        f"成交价值 {result_value} 低于「低于此价才卖红」的 {sell_limit}, 点选红连红色藏品一起整包出售"
+    )
     return True
 
 
@@ -271,12 +282,14 @@ def sell_on_settlement_screen(
     才点: 流拍的结算界面没有品质圆点行, 不能盲点那个坐标。
 
     result_value 是结算面板已读的成交价值(当前估价), 由 settle.finish_auction 透传:
-    「低于此价才卖红」> 0 时, 成交价值低于它才执行出售红, 不低于或读不出则红色
-    藏品保留不卖 —— 判定失败的保守方向是保留, 少卖可手动补卖, 误卖贵重红不可逆
-    (比较对象与沿革见 auction-notes 7)。
+    勾选「拍卖成功出售红」时按「低于此价才卖红」决定是否补点品质红 —— 结算界面的
+    品质默认勾选除红以外的全部, 补点红后一键出售连红整包全卖, 不点则只卖其余
+    品质(红色藏品保留入库)。两条分支都会点「一键出售」: 成功后清仓是本路径的
+    本职, 不能因价格判定不命中就一件不卖(2026-10-29 用户实测回归, 沿革见 auction-notes 7)。
 
-    这条路径不碰藏品仓库, 也不做满仓检测: 一键出售是游戏自己的整包出售, 没有品质
-    勾选, 也读不到「出售价值」, 因此不复用仓库出售流程。
+    这条路径不碰藏品仓库, 也不做满仓检测: 一键出售是游戏自己的出售, 品质勾选是
+    结算界面自带的默认态(除红以外全选, 补点红才含红), 也读不到「出售价值」,
+    因此不复用仓库出售流程。
 
     关提示条分两步: 先用「点击空白区域关闭」确认提示条出现了, 再点提示条以外的
     空白区域 —— 游戏要求点的是空白区域, 不是那句提示文字本身。
@@ -301,10 +314,11 @@ def sell_on_settlement_screen(
             0,
             warn="「低于此价才卖红」配置无效, 按不限处理",
         )
-        if sell_limit > 0 and not _sell_red_allowed(task, result_value, sell_limit):
-            return
-        task.operate_click(*POS_SETTLE_QUALITY_RED, after_sleep=0.5)
-        task.log_info("已点选品质红, 一键出售只卖红色品质藏品")
+        # 判定只决定「点不点红」, 不拦截出售本身: 点红 = 连红整包全卖,
+        # 不点 = 只卖除红以外的品质(结算界面默认勾选的就是除红以外全部)。
+        if _should_select_sell_red(task, result_value, sell_limit):
+            task.operate_click(*POS_SETTLE_QUALITY_RED, after_sleep=0.5)
+            task.log_info("已点选品质红, 一键出售连红色藏品一起整包出售")
     task.operate_click(found, after_sleep=1)
     task.log_info("已点击一键出售")
 
