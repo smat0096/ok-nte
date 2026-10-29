@@ -79,3 +79,6 @@ site/
 mid_lib/*
 !mid_lib/public
 .brooks-lint-history.json
+
+# ok-script single-instance mutex pid marker (runtime artifact, may fall back to repo root when %TEMP% is not writable)
+ok-script-*.pid
