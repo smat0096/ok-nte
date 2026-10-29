@@ -8,22 +8,23 @@ config_description 三个构建器装配, 键与值必须与迁移前逐一致�
 # --- 拍卖配置 ---
 CONF_FIXED_PRICE = "基础价"
 
-# 藏品出售: 用一个模式下拉框统一控制, 相关子配置集中显示在它下面。
-# 旧版的「启用自动清理藏品」开关与「出售藏品间隔次数」是互斥的两档, 现在合并进模式:
-#   不出售           -> 完全不碰仓库
-#   满仓时清理       -> 只在主界面出现「库存不足」提示时出售
-#   按间隔出售       -> 每 N 轮出售一次, 满仓时提前触发
+# 藏品出售: 用一个模式下拉框统一控制定期出售, 相关子配置集中显示在它下面。
+# 「满仓时清理」原是本下拉框的一档, 2026-10-29 移出为下面的独立开关
+# CONF_FULL_CLEANUP, 可与任意出售模式组合:
+#   不出售           -> 完全不碰仓库(满仓清理开关也关掉时)
+#   按间隔出售       -> 每 N 轮出售一次
 #   拍卖成功一键出售 -> 用游戏自带的一键出售, 在结算界面直接卖掉本局藏品, 不碰仓库
-# 前三种走同一套「仓库流程」(满仓检测 + 品质勾选 + 确认出售), 第四种是另一条独立路径,
-# 见 _uses_collection_sell / _sell_on_settlement_screen。
+# 「按间隔出售」与满仓清理走同一套「仓库流程」(满仓检测 + 品质勾选 + 确认出售),
+# 一键出售是另一条独立路径, 见 _uses_collection_sell / _sell_on_settlement_screen。
 CONF_SELL_MODE = "出售藏品模式"
 SELL_MODE_OFF = "不出售"
+# 旧版出售模式的「满仓时清理」取值: 已不在 SELL_MODES 里, 老配置存了这个值时由
+# sell.normalize_mode 按「不出售」兜底, 满仓清理行为由默认开启的独立开关接续。
 SELL_MODE_FULL = "满仓时清理"
 SELL_MODE_ONE_CLICK = "拍卖成功一键出售"
 SELL_MODE_INTERVAL = "按间隔出售"
 SELL_MODES = (
     SELL_MODE_OFF,
-    SELL_MODE_FULL,
     SELL_MODE_INTERVAL,
     SELL_MODE_ONE_CLICK,
 )
@@ -33,6 +34,31 @@ CONF_SELL_INTERVAL = "出售藏品间隔次数"
 # 低保金的领取前提是资产低于 10 万, 卖藏品会抬高资产 —— 想领低保就别多勾
 # 高价值品质 (双清单合并历史见 auction-notes 4)。
 CONF_SELL_QUALITIES = "出售品质"
+
+# 满仓时清理(独立开关, 2026-10-29 从出售模式移出): 主界面出现「库存不足」提示
+# (满仓无法继续出价)时, 按「出售品质」去藏品仓库出售勾选品质。
+CONF_FULL_CLEANUP = "满仓时清理"
+
+# 满仓清理出售后仍满仓(无法自动清理)时的动作, 多选 —— 出售域一落账「仍满仓」
+# 即触发, 不做下一轮复核(无人值守要靠它关机):
+#   停止使用仪器组   -> 本次运行不再装备/使用/自动购买竞拍仪器; 可单选,
+#                      也可与「自动切换到海贝场」同时勾选
+#   自动切换到海贝场 -> 会话内锁定期望会场为海贝场(无验资门槛)并立即尝试切换,
+#                      之后的轮次每轮都把会场拉回海贝场
+#   自动关机         -> 停止挂机并执行 Windows 关机命令(缓冲秒数见任务侧常量)
+#   停止挂机         -> 结束本次任务, 等待用户处理; 与「自动关机」同时勾选时关机优先
+# 都不勾时维持原行为: 每轮先复核满仓再重试清理。
+CONF_FULL_STUCK_ACTIONS = "满仓无法清理时"
+FULL_STUCK_STOP_INSTRUMENTS = "停止使用仪器组"
+FULL_STUCK_SWITCH_SEASHELL = "自动切换到海贝场"
+FULL_STUCK_SHUTDOWN = "自动关机"
+FULL_STUCK_STOP_TASK = "停止挂机"
+FULL_STUCK_ACTIONS = (
+    FULL_STUCK_STOP_INSTRUMENTS,
+    FULL_STUCK_SWITCH_SEASHELL,
+    FULL_STUCK_SHUTDOWN,
+    FULL_STUCK_STOP_TASK,
+)
 
 # 自动加价配置.
 CONF_AUTO_RAISE = "启用自动加价"
@@ -194,13 +220,19 @@ SPECIAL_ROUND_OPTIONS = [str(index) for index in range(1, 7)]
 def default_config() -> dict:
     """任务默认配置, 键为上面的配置键常量, 顺序与面板控件顺序一致。"""
     return {
-        # 出售藏品相关配置集中放在最前面, 由模式下拉框统一控制可见性,
-        # 避免「出售间隔 / 出售品质 / 自动清理」散落在面板各处.
+        # 出售藏品相关配置集中放在最前面, 由模式下拉框与「满仓时清理」开关控制可见性,
+        # 避免「出售间隔 / 出售品质 / 满仓动作」散落在面板各处.
         CONF_SELL_MODE: SELL_MODE_ONE_CLICK,
         CONF_SELL_INTERVAL: 0,
+        # 满仓清理默认开启: 安全网方向 —— 关掉后满仓只能按「满仓无法清理时」处理或
+        # 一直卡着重试; 默认值同时接续老配置出售模式「满仓时清理」的行为.
+        CONF_FULL_CLEANUP: True,
         # 「出售品质」默认只勾低价值品质: 低保金的领取前提是资产低于 10 万,
         # 而卖藏品会抬高资产, 卖多了当天剩下的低保就领不到.
         CONF_SELL_QUALITIES: ["品质白", "品质绿", "品质蓝"],
+        # 满仓无法清理时默认不选动作: 维持原行为(每轮重试清理), 关机这类
+        # 高后果动作必须由用户显式勾选.
+        CONF_FULL_STUCK_ACTIONS: [],
         CONF_AUTO_RAISE: False,
         CONF_FIXED_PRICE: 1,
         # 会场专属基础价默认 0 = 沿用「基础价」, 老配置的单一基础价继续生效;
@@ -312,6 +344,19 @@ def config_type() -> dict:
             "type": "multi_selection",
             "options": list(QUALITY_KEYS),
         },
+        # 满仓清理开关: 「出售品质」与「满仓无法清理时」只在开启时展开。
+        # 「出售品质」只挂在本开关下而不重复挂进「按间隔出售」分支 —— 两个父条件
+        # 可以同时激活, 同键双挂会触发框架重排缺陷 (见 auction-notes 1.3);
+        # 间隔模式关掉满仓清理的组合下品质清单沿用已存的值。
+        CONF_FULL_CLEANUP: {
+            "sub_configs": {
+                True: [CONF_SELL_QUALITIES, CONF_FULL_STUCK_ACTIONS],
+            }
+        },
+        CONF_FULL_STUCK_ACTIONS: {
+            "type": "multi_selection",
+            "options": list(FULL_STUCK_ACTIONS),
+        },
         # 仪器组下拉: 候选即 INSTRUMENT_GROUPS, 默认至尊仪器组兼容旧配置.
         CONF_INSTRUMENT_GROUP: {
             "options": list(INSTRUMENT_GROUPS),
@@ -344,17 +389,13 @@ def config_type() -> dict:
                 ASSIST_SELL_RED: [CONF_SELL_RED_MAX],
             },
         },
-        # 出售模式把「出售间隔 / 出售品质」收在同一处:
-        # 选「不出售」时这些子项全部隐藏, 面板只剩一个下拉框.
+        # 出售模式只挂间隔子项: 「出售品质」归「满仓时清理」开关管(两个父条件可同时
+        # 激活, 同键双挂会触发框架重排缺陷, 见 auction-notes 1.3)。
         CONF_SELL_MODE: {
             "options": list(SELL_MODES),
             "sub_configs": {
                 SELL_MODE_OFF: [],
-                SELL_MODE_FULL: [CONF_SELL_QUALITIES],
-                SELL_MODE_INTERVAL: [
-                    CONF_SELL_INTERVAL,
-                    CONF_SELL_QUALITIES,
-                ],
+                SELL_MODE_INTERVAL: [CONF_SELL_INTERVAL],
                 # 一键出售用游戏自带的整包出售, 没有品质勾选也没有间隔, 因此没有子项.
                 SELL_MODE_ONE_CLICK: [],
             },
@@ -380,11 +421,22 @@ def config_description() -> dict:
     descriptions = {
         # --- 藏品出售 ---
         CONF_SELL_MODE: "包满了就不能再出价, 所以多少得卖点。不出售=仓库碰都不碰; "
-        "满仓时清理=弹出库存不足提示才去卖; 按间隔出售=每 N 轮卖一次, 快满会提前卖; "
-        "拍卖成功一键出售=结算时把这场拍到的全卖了, 不看仓库也不挑品质",
-        CONF_SELL_INTERVAL: "每 N 轮卖一次, 快满会提前卖; 填 0 就是不按间隔, 只在包满时清",
+        "按间隔出售=每 N 轮卖一次; 拍卖成功一键出售=结算时把这场拍到的全卖了, "
+        "不看仓库也不挑品质; 满仓时的清理是独立开关「满仓时清理」, 跟这里选什么不冲突",
+        CONF_SELL_INTERVAL: "每 N 轮卖一次; 填 0 就不按间隔出售, 只靠「满仓时清理」触发",
+        CONF_FULL_CLEANUP: "勾选后主界面出现「库存不足」提示(满仓没法再出价)时, "
+        "按「出售品质」去仓库卖掉勾选品质; 原是「出售藏品模式」里的一档, 现在独立出来, "
+        "跟任何出售模式都能搭配, 老配置选了那档的升级后行为不变; "
+        "不勾就完全不自动清理, 满仓了任务会卡着重试或按「满仓无法清理时」处理",
         CONF_SELL_QUALITIES: "勾了才卖, 没勾的都留着, 都不勾就一件不卖; "
+        "「按间隔出售」和「满仓时清理」都按这里卖; "
         "低保金要资产低于 10 万才领得到, 卖东西会让资产涨上去, 想领低保就别勾贵的",
+        CONF_FULL_STUCK_ACTIONS: "清理出售后仍是满仓(无法自动清理)时立刻执行, 可多选: "
+        "停止使用仪器组=本次运行不再装备/使用/自动购买仪器, 可单选也可和切场一起勾; "
+        "自动切换到海贝场=把期望会场锁成海贝场(无验资门槛)并马上尝试切换, 之后每轮保持; "
+        "自动关机=先停止挂机, 60 秒后关电脑(无人值守场景), 反悔要在倒计时内执行 shutdown /a; "
+        "停止挂机=结束任务等你回来处理, 和自动关机同时勾时关机优先; "
+        "都不勾=每轮继续重试清理",
         # --- 出价 ---
         CONF_AUTO_RAISE: "打开后每回合出价按「加价方式」一回合比一回合高",
         CONF_FIXED_PRICE: "通用基础价: 当前会场识别不出, 或下面某个会场的基础价填 0 时"
@@ -580,13 +632,15 @@ INST = "<br>".join(
             indent=1,
         ),
         _inst_line("第 6 次必须比第 5 次高, 一样高游戏不认", "#FF5555", bold=True, indent=2),
-        _inst_line("📦 「出售藏品模式」四选一", "#FF5555", bold=True),
+        _inst_line("📦 「出售藏品模式」三选一 + 独立开关「满仓时清理」", "#FF5555", bold=True),
         _inst_line(
-            "不出售 / 满仓时清理 / 按间隔出售 / 拍卖成功一键出售", "#FE821D", bold=True, indent=1
+            "不出售 / 按间隔出售 / 拍卖成功一键出售; 「满仓时清理」是单独的开关, 勾了才在包满时"
+            "按「出售品质」去清, 默认开", "#FE821D", bold=True, indent=1
         ),
         _inst_line(
-            "包满了就没法再出价, 至少选「满仓时清理」; 「出售藏品间隔次数」填 0 就是只在包满时清",
-            indent=2,
+            "包满了就没法再出价; 清完还是满(无法自动清理)时按「满仓无法清理时」办: 停止使用仪器组"
+            "(可单选, 也可和切场一起勾) / 自动切换到海贝场 / 自动关机(倒计时内可 shutdown /a 反悔) / "
+            "停止挂机; 都不勾就每轮重试清理", indent=2,
         ),
         _inst_line(
             "「出售品质」勾了才卖, 都不勾就一件不卖任何藏品; 低保金要资产低于 10 万才领得到,"
@@ -615,6 +669,13 @@ INST = "<br>".join(
             indent=2,
         ),
         _inst_line("🔄 升级后必看", "#FF5555", bold=True),
+        _inst_line(
+            "「出售藏品模式」里的「满仓时清理」移成了独立开关「满仓时清理」, 默认开启, "
+            "老配置选了那档的行为不变; 选「不出售」又不想自动清的把开关关掉",
+            "#FF5555",
+            bold=True,
+            indent=1,
+        ),
         _inst_line(
             "「启用辅助功能」改名「辅助功能」, 勾选状态不保留; 低保金默认改成不勾",
             "#FF5555",

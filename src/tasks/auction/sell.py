@@ -9,6 +9,10 @@ API 经它访问; 允许访问面由 contracts.AuctionSellOps 窄协议声明。
 auction_interaction.atomic_sequence, 转手后的访问面由对方模块自己的契约
 约束。
 
+「满仓时清理」(2026-10-29) 是独立开关(read_full_cleanup), 不再是出售模式的
+一档; 「满仓无法清理时」的动作清单(read_full_stuck_actions)也在这里读取,
+动作的执行(停仪器/切场/关机/停止)归任务编排层 _handle_uncleanable_inventory。
+
 跨轮满仓标记的所有者是任务实例: run_round_end_sell 以三态返回值报告结论,
 由任务侧落账 _inventory_stuck, 置位会让下一轮跳过拍卖先重试清理。
 置位/清零条件见 run_round_end_sell 的注释。
@@ -33,10 +37,13 @@ from src.tasks.auction.layout import (
 from src.tasks.auction.options import (
     ASSIST_SELL_RED,
     CONF_ASSIST_FEATURES,
+    CONF_FULL_CLEANUP,
+    CONF_FULL_STUCK_ACTIONS,
     CONF_SELL_INTERVAL,
     CONF_SELL_MODE,
     CONF_SELL_QUALITIES,
     CONF_SELL_RED_MAX,
+    FULL_STUCK_ACTIONS,
     QUALITY_KEYS,
     SELL_MODE_INTERVAL,
     SELL_MODE_OFF,
@@ -75,17 +82,45 @@ POPUP_CLOSE_TIMEOUT = 5
 
 
 def normalize_mode(raw_mode: str) -> str:
-    """出售模式取值兜底: 未知值一律按「不出售」处理, 避免脏配置意外清空仓库。"""
+    """出售模式取值兜底: 未知值一律按「不出售」处理, 避免脏配置意外清空仓库。
+
+    旧版的「满仓时清理」取值已从模式里移出(独立开关 read_full_cleanup): 老配置存了
+    这个值时同样落到「不出售」, 满仓清理行为由默认开启的开关接续。
+    """
     return raw_mode if raw_mode in SELL_MODES else SELL_MODE_OFF
 
 
 def uses_collection_sell(mode: str) -> bool:
-    """本轮是否需要走「藏品仓库」出售流程: 满仓检测 + 品质勾选 + 确认出售。
+    """该出售模式是否需要走「藏品仓库」的定期出售流程: 品质勾选 + 确认出售。
 
+    只有「按间隔出售」; 满仓清理是独立开关(见 read_full_cleanup), 不再看出售模式
+    —— 任务侧 _uses_collection_sell 把两者并在一起, 门控结算后的满仓观测与启动告警。
     「拍卖成功一键出售」用游戏自带的按钮在结算界面直接卖, 不碰仓库, 也不做满仓检测,
     因此不算这条流程 —— 见 sell_on_settlement_screen。
     """
-    return mode not in (SELL_MODE_OFF, SELL_MODE_ONE_CLICK)
+    return mode == SELL_MODE_INTERVAL
+
+
+def read_full_cleanup(config: dict) -> bool:
+    """读取独立开关「满仓时清理」; 键缺失或取值异常时按开启处理。
+
+    开启是安全方向: 满仓无法出价, 关掉清理又遇到满仓会让任务一直卡住; 该开关从
+    出售模式移出时默认开启, 也是为了接续老配置「满仓时清理」模式的行为。
+    """
+    value = config.get(CONF_FULL_CLEANUP, True)
+    return value if isinstance(value, bool) else True
+
+
+def read_full_stuck_actions(config: dict) -> list[str]:
+    """读取「满仓无法清理时」多选动作, 按 FULL_STUCK_ACTIONS 的顺序清洗去重。
+
+    值不是列表(手改配置)时按未选处理: 空选维持原行为(每轮重试清理), 不因脏配置
+    触发关机这类高后果动作。
+    """
+    selected = config.get(CONF_FULL_STUCK_ACTIONS, ())
+    if not isinstance(selected, (list, tuple)):
+        return []
+    return [action for action in FULL_STUCK_ACTIONS if action in selected]
 
 
 def read_quality_list(config: dict, key: str) -> list[str]:
@@ -298,11 +333,13 @@ def run_round_end_sell(
     deadline: float | None = None,
     state: PostRoundState | None = None,
 ) -> bool | None:
-    """按出售模式决定本轮是否出售藏品。
+    """按出售模式与「满仓时清理」开关决定本轮是否出售藏品。
 
-    「满仓时清理」只在主界面出现库存不足提示时出售; 「按间隔出售」每 N 轮出售一次,
-    且间隔没到就满仓时提前出售(库存不足无法继续出价, 等间隔会卡住拍卖)。
-    「不出售」与「拍卖成功一键出售」不走这里: 后者在结算界面就卖完了。
+    「按间隔出售」每 N 轮出售一次; 独立开关「满仓时清理」(2026-10-29 从出售模式的
+    一档移出)开启时, 主界面出现库存不足提示(满仓无法继续出价)就出售, 与出售模式
+    可任意组合。开关关闭时不做满仓检测, 也不采信结算后观测记录的满仓结论(含横幅
+    落账) —— 间隔没到就不出售, 满仓由任务侧按既有路径(轮次失败/满仓复核)处理。
+    「不出售」与「拍卖成功一键出售」不走定期出售: 后者在结算界面就卖完了。
 
     仅应在拍卖结束回到主界面后调用, 否则仓库入口 OCR 无法命中。
 
@@ -313,26 +350,29 @@ def run_round_end_sell(
         同样不落账 (误置与误清的代价见 auction-notes 5.2)。
     """
     mode = normalize_mode(str(task.config.get(CONF_SELL_MODE, SELL_MODE_OFF)))
-    if not uses_collection_sell(mode):
-        # 「不出售」不碰仓库; 「一键出售」在结算界面就卖完了(见 sell_on_settlement_screen),
-        # 与轮次末尾无关.
+    interval_mode = uses_collection_sell(mode)
+    cleanup_enabled = read_full_cleanup(task.config)
+    if not interval_mode and not cleanup_enabled:
+        # 「不出售」/「一键出售」且满仓清理关闭: 定期出售与满仓清理都不走这里.
         return None
 
     sell_interval = 0
-    if mode == SELL_MODE_INTERVAL:
+    if interval_mode:
         cfg = auction_config_read.ConfigReader(task.config, task.log_warning)
         sell_interval = cfg.read_int(
             CONF_SELL_INTERVAL,
             0,
-            warn="出售间隔次数配置无效, 按满仓清理处理",
+            warn="出售间隔次数配置无效, 按满仓清理触发处理",
         )
         if sell_interval <= 0:
-            # 间隔无效时退化成「满仓时清理」, 而不是直接不出售.
-            task.log_warning("出售间隔次数未设置, 本次按满仓清理处理")
+            # 间隔无效时退化为只按满仓清理触发, 而不是直接不出售.
+            task.log_warning("出售间隔次数未设置, 本次按满仓清理触发处理")
 
     state = state or PostRoundState()
-    inventory_full = state.inventory_full
-    if inventory_full is None:
+    # 清理开关关闭时忽略结算后观测的满仓结论: 不检测也不采信, 间隔模式退化为
+    # 严格按间隔出售(不再「满仓提前触发」—— 那正是被移出的满仓清理功能)。
+    inventory_full = state.inventory_full if cleanup_enabled else None
+    if cleanup_enabled and inventory_full is None:
         # 结算后观测没测出满仓结论(含当时 deadline 用尽)时在这里补测:
         # 本方法在轮次末尾调用, deadline 为空, 有完整的 INVENTORY_FULL_TIMEOUT 可用。
         # 预算耗尽(None)按「未测出」处理, 轮次末尾的满仓复核会再次裁决。
@@ -348,7 +388,7 @@ def run_round_end_sell(
     if reached_interval:
         task.log_info(f"第 {task.current_round} 轮到达出售间隔 {sell_interval}, 执行定期出售")
     else:
-        task.log_info("检测到满仓提示, 提前执行藏品出售")
+        task.log_info("检测到满仓提示, 执行满仓清理出售")
 
     # 出售失败固定退出: 不再放宽清单(连续失败放宽已删除, 见 auction-notes 4),
     # 跨轮满仓标记由任务侧落账, 这里只报告结论。三种结果必须区分:

@@ -25,6 +25,7 @@ class TestAuctionInstrumentVenue(unittest.TestCase):
         task._instrument_slots = []
         task._instrument_seq_raw = None
         task._instrument_seq = 0
+        task._instrument_stuck_disabled = False
         task._assist_enabled = Mock(return_value=True)
         task.log_info = Mock()
         task.log_warning = Mock()

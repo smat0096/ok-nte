@@ -1,4 +1,5 @@
 import re
+import subprocess
 import time
 import traceback
 from collections.abc import Callable
@@ -60,6 +61,10 @@ from src.tasks.auction.options import (
     CONF_SELL_QUALITIES,
     CONF_VENUE_INSTRUMENT_GROUPS,
     CONF_VENUE_INSTRUMENT_SEQUENCES,
+    FULL_STUCK_SHUTDOWN,
+    FULL_STUCK_STOP_INSTRUMENTS,
+    FULL_STUCK_STOP_TASK,
+    FULL_STUCK_SWITCH_SEASHELL,
     INST,
     INSTRUMENT_GROUP_INHERIT,
     INSTRUMENT_GROUP_NONE,
@@ -68,16 +73,35 @@ from src.tasks.auction.options import (
     RAISE_MODE_MULTIPLE,
     RAISE_MODES,
     SELL_MODE_OFF,
+    VENUE_SEASHELL,
 )
 from src.tasks.BaseNTETask import BaseNTETask
 from src.tasks.NTEOneTimeTask import NTEOneTimeTask
+
+
+def _request_windows_shutdown(delay_seconds: int) -> None:
+    """执行 Windows 关机命令(shutdown /s /t N), 失败时抛出异常由调用方记录。
+
+    独立成模块级函数是测试注入点: 用例 patch 本函数覆盖关机分支, 不对系统
+    真发关机命令。延迟参数给用户留反悔窗口(倒计时内 shutdown /a 可取消)。
+    """
+    subprocess.run(
+        ["shutdown", "/s", "/t", str(int(delay_seconds))],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
 
 
 class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     """自动完成游戏内拍卖流程。
 
     功能包括: 会场自动切换, 匹配, 确认, 出价, 出价重试, 结算, 低保金领取,
-    表情包发送, 藏品出售。配置了「期望会场名」时, 每轮匹配前按资产验资门槛自动
+    表情包发送, 藏品出售。满仓时清理是独立开关(可与任意出售模式组合); 清理后
+    仍满仓(无法自动清理)时可配置停止仪器/切海贝场/关机/停止挂机
+    (见 _handle_uncleanable_inventory 与 auction_options.FULL_STUCK_ACTIONS)。
+    配置了「期望会场名」时, 每轮匹配前按资产验资门槛自动
     换到目标会场; 基础价、仪器组与仪器槽位序列都按当前会场分别取
     (见 auction_venue / auction_options)。
 
@@ -89,6 +113,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 轮次末尾出售流程的总预算。出售是收尾动作, 不该像拍卖阶段那样吃掉整轮 600 秒
     # (预算构成见 auction-notes 5.7); 出售域自己的常量见 auction_sell。
     SELL_TIMEOUT = 90
+    # 「满仓无法清理时」勾选「自动关机」的缓冲秒数: 关机不可逆, 留出反悔窗口
+    # (倒计时内执行 shutdown /a 可取消), 也让任务的收尾日志来得及发出。
+    SHUTDOWN_DELAY_SECONDS = 60
 
     # --- 阶段超时 (秒) ---
     # 单轮拍卖的硬上限, 防止各阶段局部超时叠加后长期卡住任务.
@@ -149,7 +176,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         #   _instrument_remaining(仪器队列: 尚未使用的满列表槽位号, 按当前视觉顺序) /
         #   _instrument_group_ready。
         # 会话级: _session_result_total / _session_result_rounds / _welfare_state
-        #   / _asset_routed_mode(资产路由的模式覆盖, 见 _observe_main_asset)。
+        #   / _asset_routed_mode(资产路由的模式覆盖, 见 _observe_main_asset)
+        #   / _inventory_stuck_venue 与 _instrument_stuck_disabled(满仓无法清理时的
+        #   动作锁存, 见 _handle_uncleanable_inventory)。
         # 轮次级: 归 _reset_round_state 唯一入口, 含 _instrument_seq(仪器槽位序列
         #   游标, 每件拍品从序列第 1 项开始; 序列内容变化时也归零, 见
         #   _refresh_instrument_slots) / _inventory_hint_seen(满仓横幅落账, 见
@@ -190,6 +219,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 结算后观测最早在首轮结算后才跑, 带低资产直接进场时首轮仍会按原模式
         # 出价, 预检在入场确认后补一次读数 (见 auction_routing.route_before_first_bid)。
         self._asset_route_prechecked = False
+        # 满仓无法清理时的动作锁存(会话级, 不随轮次重置, 见 _handle_uncleanable_inventory):
+        # _inventory_stuck_venue 非 None 时作为期望会场目标优先于用户配置(切海贝场后
+        # 每轮保持); _instrument_stuck_disabled 置位后本次运行不再装备/使用/购买仪器
+        # (满仓后本场不会再出价, 仪器组的自动补全却真实扣钱)。
+        self._inventory_stuck_venue: str | None = None
+        self._instrument_stuck_disabled = False
         # 当前会场的归一化结果(None = 未识别), 由 _check_expected_venue 与每轮
         # _ensure_expected_venue 刷新; 出价时据此取对应会场的基础价 (见 auction_venue)。
         self._current_venue: str | None = None
@@ -458,6 +493,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             else:
                 self.log_warning("满仓未清理, 跳过本轮拍卖, 先重试清理藏品")
                 self.add_failed("满仓未清理")
+                # 清理出售的结论在这里落账: 返回 True(仍满仓)时由
+                # _run_round_end_sell 当场执行「满仓无法清理时」的动作。
                 self._try_sell_collections(PostRoundState(inventory_full=True), boxes)
                 return
 
@@ -496,24 +533,114 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.log_warning(f"当前会场「{venue}」不是期望的「{expected}」, 将尝试自动切换")
 
     def _ensure_expected_venue(self, boxes: AuctionBoxes) -> bool:
-        """每轮匹配前核对并自动切换期望会场, 实现见 auction_venue.ensure_expected_venue。"""
-        return auction_venue.ensure_expected_venue(self, boxes)
+        """每轮匹配前核对并自动切换期望会场, 实现见 auction_venue.ensure_expected_venue。
 
-    def _try_sell_collections(self, state: PostRoundState, boxes: AuctionBoxes) -> None:
+        满仓无法清理时锁存的海贝场目标(_inventory_stuck_venue)优先于用户配置,
+        见 _stuck_switch_to_seashell。
+        """
+        return auction_venue.ensure_expected_venue(
+            self, boxes, override=self._inventory_stuck_venue
+        )
+
+    def _try_sell_collections(self, state: PostRoundState, boxes: AuctionBoxes) -> bool | None:
         """轮次末尾的出售入口: 给出售流程一个独立的、有界的预算。
 
         出售域的逐分支等待没有上级预算约束时, 仓库入口读不到会让任务表现为
         「在跑但几乎不出价」且日志看不出时间被谁吃掉, 所以这里授予 SELL_TIMEOUT
         预算 (构成见 auction-notes 5.7)。出售失败不影响本轮已记下的结论,
         因此兜住 WaitFailedException。
+
+        Returns:
+            出售结论(与 auction_sell.run_round_end_sell 同口径): True 仍满仓 /
+            False 已清掉 / None 无新结论(未触发/结果未知)或预算耗尽。「无法自动
+            清理」的动作已在内部的 _run_round_end_sell 里执行, 调用方无需再判。
         """
         sell_deadline = time.monotonic() + self.SELL_TIMEOUT
         try:
-            self._run_round_end_sell(boxes, sell_deadline, state=state)
+            return self._run_round_end_sell(boxes, sell_deadline, state=state)
         except TaskDisabledException:
             raise
         except WaitFailedException as e:
             self.log_warning(f"藏品出售超出 {self.SELL_TIMEOUT} 秒预算, 本轮放弃出售: {e}")
+            return None
+
+    # --- 满仓无法清理时的动作 (配置键见 auction_options.FULL_STUCK_ACTIONS) ---
+    def _handle_uncleanable_inventory(self, boxes: AuctionBoxes) -> None:
+        """满仓清理出售后仍满仓(无法自动清理): 按「满仓无法清理时」执行选定的动作。
+
+        触发点是 _run_round_end_sell 落账 True 的当场 —— 出售域结论「本轮确认
+        满仓且清理未成功」即触发, 不加下一轮复核: 无人值守场景下漏触发(整夜
+        空转)的代价高于误触发(关机带缓冲可反悔)。
+        动作顺序: 停止使用仪器组 -> 自动切换到海贝场(两项可同选, 前者也可单选)
+        -> 终止动作(自动关机与停止挂机同时勾选时关机优先)。都不勾时维持原行为:
+        每轮先复核满仓再重试清理。动作清单读取与清洗见
+        auction_sell.read_full_stuck_actions。
+        """
+        actions = auction_sell.read_full_stuck_actions(self.config)
+        if not actions:
+            self.log_warning(
+                "满仓无法自动清理, 未配置「满仓无法清理时」动作, 下一轮继续重试清理"
+            )
+            return
+        if FULL_STUCK_STOP_INSTRUMENTS in actions:
+            self._stuck_disable_instruments()
+        if FULL_STUCK_SWITCH_SEASHELL in actions:
+            self._stuck_switch_to_seashell(boxes)
+        if FULL_STUCK_SHUTDOWN in actions:
+            self._stuck_shutdown()
+        elif FULL_STUCK_STOP_TASK in actions:
+            self.stop_rounds("满仓无法清理")
+            self.log_warning(
+                "满仓无法自动清理, 已停止挂机, 请手动清理藏品后重新启动", notify=True
+            )
+
+    def _stuck_disable_instruments(self) -> None:
+        """「停止使用仪器组」: 会话内停止装备/使用/自动购买竞拍仪器。
+
+        满仓后本场不会再出价, 仪器组的自动补全却真实扣钱; 置位锁存由
+        _venue_instrument_enabled 门控(装备校验与每口使用一起关掉), 本次
+        运行内不再恢复。幂等: 重复触发不重复告警。
+        """
+        if self._instrument_stuck_disabled:
+            return
+        self._instrument_stuck_disabled = True
+        self.log_warning(
+            "满仓无法清理, 本次运行停止装备/使用/自动购买竞拍仪器", notify=True
+        )
+
+    def _stuck_switch_to_seashell(self, boxes: AuctionBoxes) -> None:
+        """「自动切换到海贝场」: 锁存会话目标会场并立即尝试切换。
+
+        锁存经 _ensure_expected_venue 优先于用户配置的「期望会场名」, 之后的
+        每轮都会把会场拉回海贝场 —— 覆盖切换当场失败、或掉线回场后被游戏送回
+        别的会场的情况。海贝场无验资门槛, 直接走 switch_venue, 不重复
+        ensure_expected_venue 的资产判定; 已在海贝场时跳过重复切换(再点候选
+        可能重复扣入场费)。
+        """
+        if self._inventory_stuck_venue == VENUE_SEASHELL and self._current_venue == VENUE_SEASHELL:
+            self.log_debug("已在海贝场, 跳过重复切换")
+            return
+        self._inventory_stuck_venue = VENUE_SEASHELL
+        self.log_warning(
+            "满仓无法清理, 尝试自动切换到海贝场(本次运行锁定该会场)", notify=True
+        )
+        self.info_set("当前阶段", "切换会场")
+        deadline = time.monotonic() + auction_venue.VENUE_SWITCH_TIMEOUT
+        try:
+            switched = auction_venue.switch_venue(self, boxes, VENUE_SEASHELL, deadline)
+        except TaskDisabledException:
+            raise
+        except Exception as e:
+            self._log_aux_error("满仓后的海贝场切换失败", e)
+            switched = False
+        finally:
+            self.info_set("当前阶段", "匹配中")
+        if switched:
+            self._current_venue = VENUE_SEASHELL
+            self.info_set("当前会场", VENUE_SEASHELL)
+            self.log_info("已切换到海贝场")
+        else:
+            self.log_warning("未能切换到海贝场, 下一轮将按锁存目标重试")
 
     # --- 单轮流程编排 ---
     def _exec_auction_round(self, boxes: AuctionBoxes) -> bool:
@@ -1005,6 +1132,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """
         if not self._assist_enabled(ASSIST_INSTRUMENT):
             return False
+        # 满仓无法清理时的会话锁存: 满仓后本场不会再出价, 自动补全仪器却真实扣钱
+        # (见 _stuck_disable_instruments)。
+        if self._instrument_stuck_disabled:
+            return False
         if venue is None:
             return True
         key = auction_venue.instrument_group_key(venue)
@@ -1033,8 +1164,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             auction_emote.send_first_emote(self)
 
     def _uses_collection_sell(self) -> bool:
-        """本轮是否需要走「藏品仓库」出售流程, 判定见 auction_sell.uses_collection_sell。"""
-        return auction_sell.uses_collection_sell(self._sell_mode())
+        """本轮是否需要走「藏品仓库」出售流程(满仓观测的门控), 见 auction_sell。
+
+        「按间隔出售」或独立开关「满仓时清理」开启时为 True: 两者都要做满仓
+        观测并共用仓库出售流程; 开关判定见 sell.read_full_cleanup。
+        """
+        return auction_sell.uses_collection_sell(
+            self._sell_mode()
+        ) or auction_sell.read_full_cleanup(self.config)
 
     def _detect_inventory_full(self, boxes: AuctionBoxes, timeout: float) -> bool | None:
         """检测主界面的库存不足提示, 实现见 auction_sell.detect_inventory_full。"""
@@ -1295,10 +1432,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         )
 
     def _warn_if_no_sellable_quality(self) -> None:
-        """出售品质清单为空时给出告警: 开了出售模式却没有可出售的品质。
+        """出售品质清单为空时给出告警: 能走仓库出售却没有可出售的品质。
 
         配置本身不非法(用户可以随时改), 所以只告警不拦截。但满仓时这种配置会让
-        出售一直报「成功」却清不出空间, 之后每轮出价都失败, 提前说清楚更好排查。
+        出售一直报「成功」却清不出空间, 之后每轮出价都失败, 提前说清楚更好排查;
+        能走仓库出售 = 「按间隔出售」或「满仓时清理」开启(见 _uses_collection_sell)。
         """
         if not self._uses_collection_sell():
             return
@@ -1606,22 +1744,54 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self.operate_click(found, after_sleep=after_sleep)
         return True
 
+    def _stuck_shutdown(self) -> None:
+        """「自动关机」: 停止挂机后执行 Windows 关机命令, 失败时明确报错。
+
+        关机命令带 SHUTDOWN_DELAY_SECONDS 缓冲并在日志里给出取消方式; 命令
+        失败(权限/系统策略)时任务已停止, 由通知提醒用户手动处理。
+        """
+        self.stop_rounds("满仓无法清理, 自动关机")
+        self.log_error(
+            f"满仓无法清理, 将在 {self.SHUTDOWN_DELAY_SECONDS} 秒后关闭电脑"
+            "(倒计时内可用 shutdown /a 取消)",
+            notify=True,
+        )
+        try:
+            _request_windows_shutdown(self.SHUTDOWN_DELAY_SECONDS)
+        except TaskDisabledException:
+            raise
+        except Exception as e:
+            self.log_error(
+                f"自动关机命令执行失败, 请手动处理: {type(e).__name__}: {e}", notify=True
+            )
+
     # --- 藏品出售 ---
     def _run_round_end_sell(
         self,
         boxes: AuctionBoxes,
         deadline: float | None = None,
         state: PostRoundState | None = None,
-    ) -> None:
-        """按出售模式决定本轮是否出售, 实现见 auction_sell.run_round_end_sell。
+    ) -> bool | None:
+        """按出售模式与「满仓时清理」开关决定本轮是否出售, 实现见 auction_sell。
 
         出售结论在这里落账: _inventory_stuck 是任务侧的跨轮编排状态, 出售模块
         只报告三态结果(True 仍满仓 / False 已清掉 / None 无新结论); 异常路径
         不会走到落账, 标记保持原值 (误置与误清的代价见 auction-notes 5.2)。
+        落账为 True(清理出售后仍满仓)时当场执行「满仓无法清理时」的动作 ——
+        本方法同时覆盖轮次末尾出售与满仓重试两条路径, 是动作的唯一触发点。
+
+        Returns:
+            出售结论原样返回, 供调用方继续编排(动作已在内部执行)。
         """
         outcome = auction_sell.run_round_end_sell(self, boxes, deadline, state=state)
         if outcome is not None:
             self._inventory_stuck = outcome
+        if outcome is True:
+            # 判据就是出售域的落账结论本身(本轮确认满仓且清理未成功), 不加下一轮
+            # 复核: 无人值守场景下漏触发(整夜空转、该关的没关)的代价高于误触发
+            # (关机带 SHUTDOWN_DELAY_SECONDS 缓冲, 倒计时内 shutdown /a 可反悔)。
+            self._handle_uncleanable_inventory(boxes)
+        return outcome
 
     def _close_warehouse(self, boxes: AuctionBoxes) -> None:
         """关掉藏品仓库界面复位出售模式与勾选态, 实现见 auction_sell.close_warehouse。"""

@@ -139,8 +139,14 @@ def resolve_base_price(config: dict, venue: str | None, default: int = 1) -> int
     return auction_config_read.read_int(config, CONF_FIXED_PRICE, default)
 
 
-def ensure_expected_venue(task: AuctionVenueOps, boxes: AuctionBoxes) -> bool:
+def ensure_expected_venue(
+    task: AuctionVenueOps, boxes: AuctionBoxes, override: str | None = None
+) -> bool:
     """每轮匹配前核对期望会场, 资产达到验资门槛时自动切换。
+
+    override 是任务侧会话级锁存的目标会场(满仓无法清理时切海贝场, 见任务侧
+    _handle_uncleanable_inventory): 非 None 时优先于用户配置的「期望会场名」,
+    本次运行内每轮都把会场拉回目标。归一化失败(空文本)时回退用户配置。
 
     返回是否发生了切换。当前会场已经是期望会场时只读一次会场文字; 未配置
     期望会场、会场文字读不出、资产读不出或资产不够门槛时都不切换, 其中
@@ -153,7 +159,7 @@ def ensure_expected_venue(task: AuctionVenueOps, boxes: AuctionBoxes) -> bool:
     if current is not None:
         task.info_set("当前会场", current)
 
-    target = expected_venue(task.config)
+    target = normalize_venue(override) if override else expected_venue(task.config)
     if target is None:
         return False
     if current == target:
